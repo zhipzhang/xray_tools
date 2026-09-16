@@ -1,9 +1,12 @@
 # xray-tools
 
-Small, dependency-light utilities and data models for Chandra and other X-ray
-observatory data analysis.
+Pythonic, thin wrappers for reproducible Chandra/CIAO analysis. Event selections
+remain lazy CIAO Data Model expressions; light curves, GTIs, and explicitly
+written event selections are file-backed products.
 
 ## Installation
+
+Install the package inside a configured CIAO 4.18 environment:
 
 ```bash
 python -m pip install -e .
@@ -12,19 +15,22 @@ python -m pip install -e .
 ## Quick start
 
 ```python
-from xray_tools import ChandraACIS, Observation, energy_to_wavelength
+from xray_tools import CIAOEvents
 
-observation = Observation(
-    observatory="Chandra",
-    instrument="ACIS-I",
-    obs_id="12345",
-    exposure_ks=42.5,
+events = CIAOEvents("acisf03843_repro_evt2.fits")
+background = events.energy(2500, 7000).exclude_region("source.reg")
+
+print(background.dm)
+
+lightcurve = background.lightcurve(
+    "products/background.lc",
+    binsize=259.28,
+    clobber=True,
 )
+gti = lightcurve.clean("products/background_clean.gti", plot=False)
 
-print(observation.exposure_s)             # 42500.0
-print(energy_to_wavelength(1.0))          # 12.398419843320026 Angstrom
-print(ChandraACIS.pixel_scale_arcsec)     # 0.492
+events.apply_gti(gti).write("products/clean_evt2.fits", clobber=True)
 ```
 
-The package intentionally has no required runtime dependencies. It can be used
-alongside Astropy, CIAO, and mission-specific analysis environments.
+CIAO and `pycrates` are loaded only when an operation needs them, so the package
+can still be imported in documentation and unit-test environments without CIAO.

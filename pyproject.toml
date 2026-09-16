@@ -22,6 +22,14 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Astronomy",
 ]
+dependencies = [
+  "astropy",
+  "numpy",
+  "pandas",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/xray_tools"]
