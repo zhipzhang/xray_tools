@@ -27,7 +27,10 @@ lightcurve = background.lightcurve(
     binsize=259.28,
     clobber=True,
 )
-gti = lightcurve.clean("products/background_clean.gti", plot=False)
+gti = lightcurve.clean("products/background_clean.gti")
+
+lightcurve.plot(gti=gti, title="SS 433 background")  # shaded good times, cut levels, ontime
+print(gti.cuts)           # count-rate limits lc_clean applied
 
 events.apply_gti(gti).write("products/clean_evt2.fits", clobber=True)
 ```

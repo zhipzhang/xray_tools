@@ -5,7 +5,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from xray_tools import CIAOGTI, CIAOLightCurve
+from xray_tools import CIAOGTI, CIAOLightCurve, LightCurveCuts
+from xray_tools.products import _parse_userlimit_cuts
 
 
 class FakeColumn:
@@ -64,8 +65,8 @@ def test_plot_uses_count_rate_and_returns_axes(lightcurve_file: Path) -> None:
 
     assert result is axes
     axes.plot.assert_called_once()
-    axes.set_xlabel.assert_called_once_with("TIME")
-    axes.set_ylabel.assert_called_once_with("Count rate")
+    axes.set_xlabel.assert_called_once_with("Elapsed time (ks)")
+    axes.set_ylabel.assert_called_once_with("Count rate (count/s)")
 
 
 def test_plot_requires_a_rate_column(lightcurve_file: Path) -> None:
@@ -90,7 +91,6 @@ def test_clean_forwards_ciao_parameters(lightcurve_file: Path) -> None:
             sigma=3.0,
             scale=1.5,
             minfrac=0.2,
-            plot=False,
             verbose=2,
         )
 
@@ -111,3 +111,192 @@ def test_clean_forwards_ciao_parameters(lightcurve_file: Path) -> None:
 def test_clean_requires_a_real_lightcurve(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="light-curve file"):
         CIAOLightCurve(tmp_path / "missing.lc").clean(tmp_path / "clean.gti")
+
+
+def test_clean_never_plots(lightcurve_file: Path) -> None:
+    output = lightcurve_file.parent / "background_clean.gti"
+    lc_clean = Mock()
+
+    with (
+        patch("xray_tools.products.require_lc_clean", return_value=lc_clean),
+        patch.object(CIAOLightCurve, "plot") as plot,
+    ):
+        result = CIAOLightCurve(lightcurve_file).clean(output)
+
+    assert lc_clean.call_args.kwargs["plot"] is False
+    plot.assert_not_called()
+    assert result == CIAOGTI(output)
+
+
+def test_lightcurve_to_pandas_copies_rate_errors(lightcurve_file: Path) -> None:
+    time = np.array([1.0, 2.0])
+    rate = np.array([0.1, 0.2])
+    error = np.array([0.01, 0.02])
+    crate = FakeCrate({"TIME": time, "COUNT_RATE": rate, "COUNT_RATE_ERR": error})
+    pycrates = Mock()
+    pycrates.read_file.return_value = crate
+
+    with patch("xray_tools.products.require_pycrates", return_value=pycrates):
+        frame = CIAOLightCurve(lightcurve_file).to_pandas()
+
+    assert list(frame.columns) == ["time", "count_rate", "count_rate_err"]
+
+
+def test_plot_draws_steps_and_errorbars(lightcurve_file: Path) -> None:
+    frame = pd.DataFrame(
+        {
+            "time": [1.5, 2.5],
+            "time_min": [1.0, 2.0],
+            "time_max": [2.0, 3.0],
+            "count_rate": [0.1, 0.2],
+            "count_rate_err": [0.01, 0.02],
+        }
+    )
+    axes = Mock()
+
+    with patch.object(CIAOLightCurve, "to_pandas", return_value=frame):
+        result = CIAOLightCurve(lightcurve_file).plot(ax=axes)
+
+    assert result is axes
+    (x, y), kwargs = axes.plot.call_args
+    assert kwargs["drawstyle"] == "steps-post"
+    assert list(x) == [0.0, 0.001, 0.002]
+    assert list(y) == [0.1, 0.2, 0.2]
+    (err_x, err_y, *_), err_kwargs = axes.errorbar.call_args
+    assert list(err_x) == [0.0005, 0.0015]
+    assert err_kwargs["yerr"] is frame["count_rate_err"]
+    axes.set_xlabel.assert_called_once_with("Elapsed time (ks)")
+
+
+def test_plot_overlays_gti_regions_and_cuts(
+    lightcurve_file: Path,
+    tmp_path: Path,
+) -> None:
+    frame = pd.DataFrame(
+        {
+            "time": [1500.0, 2500.0],
+            "time_min": [1000.0, 2000.0],
+            "time_max": [2000.0, 3000.0],
+            "count_rate": [0.1, 0.2],
+        }
+    )
+    intervals = pd.DataFrame(
+        {"start": [1200.0, 2200.0], "stop": [1700.0, 2700.0], "duration": [500.0, 500.0]}
+    )
+    cuts = LightCurveCuts("count_rate", 0.05, 0.3)
+    axes = Mock()
+    gti = CIAOGTI(tmp_path / "clean.gti")
+
+    with (
+        patch.object(CIAOLightCurve, "to_pandas", return_value=frame),
+        patch.object(CIAOGTI, "to_pandas", return_value=intervals),
+        patch.object(CIAOGTI, "cuts", cuts),
+    ):
+        CIAOLightCurve(lightcurve_file).plot(ax=axes, gti=gti)
+
+    assert axes.axvspan.call_count == 2
+    assert [call.args for call in axes.axhline.call_args_list] == [(0.05,), (0.3,)]
+    _, _, annotation = axes.text.call_args.args
+    assert "Total observation: 2.00 ks" in annotation
+    assert "GTI good time: 1.00 ks (50.0%)" in annotation
+
+
+def test_plot_sets_a_given_title(lightcurve_file: Path) -> None:
+    frame = pd.DataFrame({"time": [1.0, 2.0], "count_rate": [0.1, 0.2]})
+    axes = Mock()
+
+    with patch.object(CIAOLightCurve, "to_pandas", return_value=frame):
+        CIAOLightCurve(lightcurve_file).plot(ax=axes, title="SS 433, ObsID 3843")
+
+    axes.set_title.assert_called_once_with("SS 433, ObsID 3843")
+
+
+def test_gti_to_pandas_copies_intervals(tmp_path: Path) -> None:
+    start = np.array([1.0, 5.0])
+    stop = np.array([3.0, 6.0])
+    crate = FakeCrate({"START": start, "STOP": stop})
+    pycrates = Mock()
+    pycrates.read_file.return_value = crate
+    gti_file = tmp_path / "clean.gti"
+    gti_file.touch()
+
+    with patch("xray_tools.products.require_pycrates", return_value=pycrates):
+        frame = CIAOGTI(gti_file).to_pandas()
+
+    assert list(frame.columns) == ["start", "stop", "duration"]
+    assert frame["duration"].tolist() == [2.0, 1.0]
+    pycrates.read_file.assert_called_once_with(f"{gti_file}[GTI]")
+
+
+def test_gti_to_pandas_requires_interval_columns(tmp_path: Path) -> None:
+    crate = FakeCrate({"START": np.array([1.0])})
+    pycrates = Mock()
+    pycrates.read_file.return_value = crate
+    gti_file = tmp_path / "clean.gti"
+    gti_file.touch()
+
+    with (
+        patch("xray_tools.products.require_pycrates", return_value=pycrates),
+        pytest.raises(ValueError, match="START and STOP"),
+    ):
+        CIAOGTI(gti_file).to_pandas()
+
+
+def test_gti_cuts_reads_filter_history(tmp_path: Path) -> None:
+    gti_file = tmp_path / "clean.gti"
+    gti_file.touch()
+    crate = Mock()
+    crate.get_history_records.return_value = [
+        ["HISTORY", " PARM  :userlimit=(count_rate>0.1 && count_rate<0ASC00002", "HISTNUM"],
+        ["HISTORY", " CONT  :.5)                                                      ASC00003", "HISTNUM"],
+    ]
+    pycrates = Mock()
+    pycrates.read_file.return_value = crate
+
+    with patch("xray_tools.products.require_pycrates", return_value=pycrates):
+        cuts = CIAOGTI(gti_file).cuts
+
+    pycrates.read_file.assert_called_once_with(f"{gti_file}[FILTER]")
+    assert cuts == LightCurveCuts("count_rate", 0.1, 0.5)
+
+
+def test_gti_cuts_is_none_without_filter_history(tmp_path: Path) -> None:
+    gti_file = tmp_path / "plain.gti"
+    gti_file.touch()
+    pycrates = Mock()
+    pycrates.read_file.side_effect = OSError("no FILTER block")
+
+    with patch("xray_tools.products.require_pycrates", return_value=pycrates):
+        assert CIAOGTI(gti_file).cuts is None
+
+
+def test_gti_plot_draws_interval_bars(tmp_path: Path) -> None:
+    intervals = pd.DataFrame(
+        {"start": [10.0, 20.0], "stop": [15.0, 22.0], "duration": [5.0, 2.0]}
+    )
+    axes = Mock()
+    gti = CIAOGTI(tmp_path / "clean.gti")
+
+    with patch.object(CIAOGTI, "to_pandas", return_value=intervals):
+        result = gti.plot(ax=axes)
+
+    assert result is axes
+    (xranges, yrange), _ = axes.broken_barh.call_args
+    assert list(xranges) == [(0.0, 0.005), (0.01, 0.002)]
+    assert yrange == (0, 1)
+
+
+def test_parse_userlimit_cuts_recovers_split_records() -> None:
+    records = [
+        ["HISTORY", " PARM  :userlimit=(count_rate>0.4165853273710954 && count_rate<0ASC00006", "HISTNUM"],
+        ["HISTORY", " CONT  :.5998828714143773)                                      ASC00007", "HISTNUM"],
+    ]
+
+    cuts = _parse_userlimit_cuts(records)
+
+    assert cuts == LightCurveCuts("count_rate", 0.4165853273710954, 0.5998828714143773)
+
+
+def test_parse_userlimit_cuts_without_rate_limit() -> None:
+    assert _parse_userlimit_cuts([["HISTORY", " PARM  :smooth=yes", "HISTNUM"]]) is None
+    assert _parse_userlimit_cuts([]) is None

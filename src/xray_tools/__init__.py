@@ -4,7 +4,7 @@ from .chandra import ChandraACIS
 from .events import CIAOEvents
 from .exceptions import CIAOWorkflowError
 from .observation import Observation
-from .products import CIAOGTI, CIAOLightCurve
+from .products import CIAOGTI, CIAOLightCurve, LightCurveCuts
 from .units import energy_to_wavelength, wavelength_to_energy
 
 __all__ = [
@@ -13,6 +13,7 @@ __all__ = [
     "CIAOLightCurve",
     "CIAOWorkflowError",
     "ChandraACIS",
+    "LightCurveCuts",
     "Observation",
     "energy_to_wavelength",
     "wavelength_to_energy",
