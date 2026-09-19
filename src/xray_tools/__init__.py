@@ -4,13 +4,14 @@ from .chandra import ChandraACIS
 from .events import CIAOEvents, merge_events
 from .exceptions import CIAOWorkflowError
 from .observation import Observation
-from .products import CIAOFluxImage, CIAOGTI, CIAOLightCurve, LightCurveCuts
+from .products import CIAOGTI, CIAOFluxImage, CIAOImage, CIAOLightCurve, LightCurveCuts
 from .units import energy_to_wavelength, wavelength_to_energy
 
 __all__ = [
-    "CIAOFluxImage",
     "CIAOGTI",
     "CIAOEvents",
+    "CIAOFluxImage",
+    "CIAOImage",
     "CIAOLightCurve",
     "CIAOWorkflowError",
     "ChandraACIS",

@@ -7,8 +7,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from xray_tools import CIAOFluxImage, CIAOGTI, CIAOLightCurve, LightCurveCuts
-from xray_tools.products import _discover_flux_images, _parse_userlimit_cuts
+from xray_tools import (
+    CIAOGTI,
+    CIAOFluxImage,
+    CIAOImage,
+    CIAOLightCurve,
+    CIAOWorkflowError,
+    LightCurveCuts,
+)
+from xray_tools.products.gti import _parse_userlimit_cuts
+from xray_tools.products.image import _discover_flux_images
 
 
 class FakeColumn:
@@ -27,6 +35,34 @@ class FakeCrate:
         return FakeColumn(self.columns[name])
 
 
+class FakeImageCrate:
+    def __init__(self, data, *, unit=None, keys=None):
+        self.data = np.asarray(data, dtype=float)
+        self._unit = unit
+        self._keys = dict(keys or {})
+
+    def is_image(self):
+        return True
+
+    def get_shape(self):
+        return self.data.shape
+
+    def get_image(self):
+        image = Mock()
+        image.get_unit.return_value = self._unit
+        return image
+
+    def get_key_value(self, name):
+        return self._keys.get(name)
+
+
+def fake_pycrates(crate):
+    pycrates = Mock()
+    pycrates.read_file.return_value = crate
+    pycrates.get_piximgvals.side_effect = lambda cr: cr.data
+    return pycrates
+
+
 @pytest.fixture
 def lightcurve_file(tmp_path: Path) -> Path:
     path = tmp_path / "background.lc"
@@ -37,6 +73,7 @@ def lightcurve_file(tmp_path: Path) -> Path:
 def test_product_paths_are_normalized() -> None:
     assert CIAOLightCurve("background.lc").path == Path("background.lc")
     assert CIAOGTI("background.gti").path == Path("background.gti")
+    assert CIAOImage("broad_flux.img").path == Path("broad_flux.img")
 
 
 def test_lightcurve_to_pandas_handles_optional_columns(
@@ -48,7 +85,7 @@ def test_lightcurve_to_pandas_handles_optional_columns(
     pycrates = Mock()
     pycrates.read_file.return_value = crate
 
-    with patch("xray_tools.products.require_pycrates", return_value=pycrates):
+    with patch("xray_tools.products.lightcurve.require_pycrates", return_value=pycrates):
         frame = CIAOLightCurve(lightcurve_file).to_pandas()
 
     assert list(frame.columns) == ["time", "rate"]
@@ -85,7 +122,7 @@ def test_clean_forwards_ciao_parameters(lightcurve_file: Path) -> None:
     output = lightcurve_file.parent / "background_clean.gti"
     lc_clean = Mock()
 
-    with patch("xray_tools.products.require_lc_clean", return_value=lc_clean):
+    with patch("xray_tools.products.lightcurve.require_lc_clean", return_value=lc_clean):
         result = CIAOLightCurve(lightcurve_file).clean(
             output,
             mean=0.2,
@@ -120,7 +157,7 @@ def test_clean_never_plots(lightcurve_file: Path) -> None:
     lc_clean = Mock()
 
     with (
-        patch("xray_tools.products.require_lc_clean", return_value=lc_clean),
+        patch("xray_tools.products.lightcurve.require_lc_clean", return_value=lc_clean),
         patch.object(CIAOLightCurve, "plot") as plot,
     ):
         result = CIAOLightCurve(lightcurve_file).clean(output)
@@ -138,7 +175,7 @@ def test_lightcurve_to_pandas_copies_rate_errors(lightcurve_file: Path) -> None:
     pycrates = Mock()
     pycrates.read_file.return_value = crate
 
-    with patch("xray_tools.products.require_pycrates", return_value=pycrates):
+    with patch("xray_tools.products.lightcurve.require_pycrates", return_value=pycrates):
         frame = CIAOLightCurve(lightcurve_file).to_pandas()
 
     assert list(frame.columns) == ["time", "count_rate", "count_rate_err"]
@@ -164,7 +201,7 @@ def test_plot_draws_steps_and_errorbars(lightcurve_file: Path) -> None:
     assert kwargs["drawstyle"] == "steps-post"
     assert list(x) == [0.0, 0.001, 0.002]
     assert list(y) == [0.1, 0.2, 0.2]
-    (err_x, err_y, *_), err_kwargs = axes.errorbar.call_args
+    (err_x, _err_y, *_), err_kwargs = axes.errorbar.call_args
     assert list(err_x) == [0.0005, 0.0015]
     assert err_kwargs["yerr"] is frame["count_rate_err"]
     axes.set_xlabel.assert_called_once_with("Elapsed time (ks)")
@@ -222,7 +259,7 @@ def test_gti_to_pandas_copies_intervals(tmp_path: Path) -> None:
     gti_file = tmp_path / "clean.gti"
     gti_file.touch()
 
-    with patch("xray_tools.products.require_pycrates", return_value=pycrates):
+    with patch("xray_tools.products.gti.require_pycrates", return_value=pycrates):
         frame = CIAOGTI(gti_file).to_pandas()
 
     assert list(frame.columns) == ["start", "stop", "duration"]
@@ -238,7 +275,7 @@ def test_gti_to_pandas_requires_interval_columns(tmp_path: Path) -> None:
     gti_file.touch()
 
     with (
-        patch("xray_tools.products.require_pycrates", return_value=pycrates),
+        patch("xray_tools.products.gti.require_pycrates", return_value=pycrates),
         pytest.raises(ValueError, match="START and STOP"),
     ):
         CIAOGTI(gti_file).to_pandas()
@@ -255,7 +292,7 @@ def test_gti_cuts_reads_filter_history(tmp_path: Path) -> None:
     pycrates = Mock()
     pycrates.read_file.return_value = crate
 
-    with patch("xray_tools.products.require_pycrates", return_value=pycrates):
+    with patch("xray_tools.products.gti.require_pycrates", return_value=pycrates):
         cuts = CIAOGTI(gti_file).cuts
 
     pycrates.read_file.assert_called_once_with(f"{gti_file}[FILTER]")
@@ -268,7 +305,7 @@ def test_gti_cuts_is_none_without_filter_history(tmp_path: Path) -> None:
     pycrates = Mock()
     pycrates.read_file.side_effect = OSError("no FILTER block")
 
-    with patch("xray_tools.products.require_pycrates", return_value=pycrates):
+    with patch("xray_tools.products.gti.require_pycrates", return_value=pycrates):
         assert CIAOGTI(gti_file).cuts is None
 
 
@@ -302,6 +339,66 @@ def test_parse_userlimit_cuts_recovers_split_records() -> None:
 def test_parse_userlimit_cuts_without_rate_limit() -> None:
     assert _parse_userlimit_cuts([["HISTORY", " PARM  :smooth=yes", "HISTNUM"]]) is None
     assert _parse_userlimit_cuts([]) is None
+
+
+def test_ciao_image_to_numpy_returns_raw_and_masked_arrays(tmp_path: Path) -> None:
+    path = tmp_path / "broad_flux.img"
+    path.touch()
+    crate = FakeImageCrate(np.array([[1.0, np.nan], [0.0, 4.0]]))
+    image = CIAOImage(path)
+
+    with patch("xray_tools.products.image.require_pycrates", return_value=fake_pycrates(crate)):
+        raw = image.to_numpy()
+        masked = image.to_numpy(masked=True)
+
+    assert raw.shape == (2, 2)
+    assert np.isnan(raw[0, 1])
+    assert np.ma.is_masked(masked[0, 1])
+    assert float(masked.mean()) == pytest.approx(5.0 / 3.0)
+
+
+def test_ciao_image_to_numpy_rejects_non_image_files(tmp_path: Path) -> None:
+    path = tmp_path / "events.fits"
+    path.touch()
+    crate = Mock()
+    crate.is_image.return_value = False
+
+    with (
+        patch("xray_tools.products.image.require_pycrates", return_value=fake_pycrates(crate)),
+        pytest.raises(CIAOWorkflowError, match="not a 2D image"),
+    ):
+        CIAOImage(path).to_numpy()
+
+
+def test_ciao_image_exposes_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "broad_flux.img"
+    path.touch()
+    crate = FakeImageCrate(
+        np.ones((4, 5)),
+        unit="/cm**2 /s",
+        keys={"CONTENT": "EVT2", "EXPOSURE": 67045.4, "ENERGYLO": 0.5, "ENERGYHI": 1.5},
+    )
+    image = CIAOImage(path)
+
+    with patch("xray_tools.products.image.require_pycrates", return_value=fake_pycrates(crate)):
+        assert image.shape == (4, 5)
+        assert image.unit == "/cm**2 /s"
+        assert image.content == "EVT2"
+        assert image.exposure == pytest.approx(67045.4)
+        assert image.energy_range == (0.5, 1.5)
+
+
+def test_ciao_image_metadata_defaults_to_none(tmp_path: Path) -> None:
+    path = tmp_path / "plain.img"
+    path.touch()
+    crate = FakeImageCrate(np.ones((2, 2)))
+    image = CIAOImage(path)
+
+    with patch("xray_tools.products.image.require_pycrates", return_value=fake_pycrates(crate)):
+        assert image.unit is None
+        assert image.content is None
+        assert image.exposure is None
+        assert image.energy_range is None
 
 
 def _touch(path: Path, *, stale: bool = False) -> Path:
@@ -341,8 +438,8 @@ def test_discover_flux_images_falls_back_to_unthresholded_names(tmp_path: Path) 
 
     images = _discover_flux_images(tmp_path / "ss433", since=time.time() - 5)
 
-    assert images["hard"].counts == counts
-    assert images["hard"].exposure == exposure
+    assert images["hard"].counts == CIAOImage(counts)
+    assert images["hard"].exposure == CIAOImage(exposure)
     assert images["hard"].fov is None
     assert images["hard"].psf is None
 
@@ -353,7 +450,7 @@ def test_discover_flux_images_finds_psf_maps(tmp_path: Path) -> None:
 
     images = _discover_flux_images(tmp_path / "ss433", since=time.time() - 5)
 
-    assert images["broad"].psf == psf
+    assert images["broad"].psf == CIAOImage(psf)
 
 
 def test_discover_flux_images_with_directory_outroot(tmp_path: Path) -> None:
@@ -367,7 +464,7 @@ def test_discover_flux_images_with_directory_outroot(tmp_path: Path) -> None:
     assert list(images) == ["0.5-2"]
     product = images["0.5-2"]
     assert product.band == "0.5-2"
-    assert product.flux == flux
+    assert product.flux == CIAOImage(flux)
     assert product.fov == fov
 
 
@@ -378,10 +475,26 @@ def _write_image(path: Path, data) -> Path:
     return path
 
 
+def patch_image_data(data):
+    """Patch CIAOImage.to_numpy so plot tests need no pycrates backend."""
+    return patch.object(
+        CIAOImage, "to_numpy", return_value=np.asarray(data, dtype=float)
+    )
+
+
 def _flux_product(tmp_path: Path, **files: Path) -> CIAOFluxImage:
     defaults = {"counts": None, "flux": None, "exposure": None, "fov": None, "psf": None}
     defaults.update(files)
     return CIAOFluxImage(band="broad", **defaults)
+
+
+def test_flux_image_wraps_component_paths(tmp_path: Path) -> None:
+    flux = tmp_path / "broad_flux.img"
+    flux.touch()
+    product = _flux_product(tmp_path, flux=flux)
+
+    assert isinstance(product.flux, CIAOImage)
+    assert product.flux.path == flux
 
 
 def test_flux_image_plot_displays_flux_with_log_stretch(tmp_path: Path) -> None:
@@ -391,7 +504,8 @@ def test_flux_image_plot_displays_flux_with_log_stretch(tmp_path: Path) -> None:
     product = _flux_product(tmp_path, flux=flux)
     axes = Mock()
 
-    result = product.plot(ax=axes, title="SS 433 soft")
+    with patch_image_data(np.full((4, 5), 2.0)):
+        result = product.plot(ax=axes, title="SS 433 soft")
 
     assert result is axes
     (data,), kwargs = axes.imshow.call_args
@@ -405,17 +519,28 @@ def test_flux_image_plot_displays_flux_with_log_stretch(tmp_path: Path) -> None:
 
 
 def test_flux_image_plot_masks_non_positive_values_for_log(tmp_path: Path) -> None:
-    flux = _write_image(
-        tmp_path / "broad_flux.img",
-        np.array([[0.0, -1.0], [1e-6, 1e-3]]),
-    )
+    raw = np.array([[0.0, -1.0], [1e-6, 1e-3]])
+    flux = _write_image(tmp_path / "broad_flux.img", raw)
     axes = Mock()
 
-    _flux_product(tmp_path, flux=flux).plot(ax=axes)
+    with patch_image_data(raw):
+        _flux_product(tmp_path, flux=flux).plot(ax=axes)
 
     (data,), kwargs = axes.imshow.call_args
     assert np.isnan(data).sum() == 2
     assert kwargs["norm"].vmin > 0
+
+
+def test_ciao_image_plot_uses_given_vmin_vmax(tmp_path: Path) -> None:
+    flux = _write_image(tmp_path / "broad_flux.img", np.full((3, 3), 2.0))
+    axes = Mock()
+
+    with patch_image_data(np.full((3, 3), 2.0)):
+        CIAOImage(flux).plot(ax=axes, vmin=0.5, vmax=3.0)
+
+    (_,), kwargs = axes.imshow.call_args
+    assert kwargs["norm"].vmin == 0.5
+    assert kwargs["norm"].vmax == 3.0
 
 
 def test_flux_image_plot_displays_other_components(tmp_path: Path) -> None:
@@ -427,7 +552,8 @@ def test_flux_image_plot_displays_other_components(tmp_path: Path) -> None:
 
     for component in ("counts", "exposure"):
         axes = Mock()
-        product.plot(ax=axes, component=component, stretch="sqrt")
+        with patch_image_data(np.ones((3, 3))):
+            product.plot(ax=axes, component=component, stretch="sqrt")
         (_,), kwargs = axes.imshow.call_args
         assert isinstance(kwargs["norm"].stretch, SqrtStretch)
 
@@ -448,18 +574,20 @@ def test_flux_image_plot_rejects_empty_images(tmp_path: Path) -> None:
     flux = _write_image(tmp_path / "broad_flux.img", np.zeros((3, 3)))
     product = _flux_product(tmp_path, flux=flux)
 
-    with pytest.raises(ValueError, match="no displayable data"):
+    with (
+        patch_image_data(np.zeros((3, 3))),
+        pytest.raises(ValueError, match="no displayable data"),
+    ):
         product.plot(ax=Mock())
 
 
 def test_flux_image_plot_applies_gaussian_smoothing(tmp_path: Path) -> None:
-    flux = _write_image(
-        tmp_path / "broad_flux.img",
-        np.array([[0.0, 0.0, 10.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
-    )
+    raw = np.array([[0.0, 0.0, 10.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    flux = _write_image(tmp_path / "broad_flux.img", raw)
     axes = Mock()
 
-    _flux_product(tmp_path, flux=flux).plot(ax=axes, smooth=1.0)
+    with patch_image_data(raw):
+        _flux_product(tmp_path, flux=flux).plot(ax=axes, smooth=1.0)
 
     (data,), _ = axes.imshow.call_args
     assert data[0, 2] < 10.0  # the peak is spread out
@@ -473,7 +601,8 @@ def test_flux_image_plot_fills_masked_edges_when_smoothing(tmp_path: Path) -> No
     flux = _write_image(tmp_path / "broad_flux.img", raw)
     axes = Mock()
 
-    _flux_product(tmp_path, flux=flux).plot(ax=axes, smooth=1.0)
+    with patch_image_data(raw):
+        _flux_product(tmp_path, flux=flux).plot(ax=axes, smooth=1.0)
 
     (data,), _ = axes.imshow.call_args
     assert np.isfinite(data[0, 0])  # NaN pixels are interpolated

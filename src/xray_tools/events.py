@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .exceptions import CIAOWorkflowError
-from .products import _discover_flux_images
+from .products.image import _discover_flux_images
 from .utils import (
     prepare_output_path,
     require_ciao_runtool,
@@ -21,7 +21,7 @@ from .utils import (
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .products import CIAOFluxImage, CIAOGTI, CIAOLightCurve
+    from .products import CIAOGTI, CIAOFluxImage, CIAOLightCurve
 
 
 logger = logging.getLogger("xray_tools")
