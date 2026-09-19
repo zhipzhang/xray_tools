@@ -4,7 +4,13 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 
-from xray_tools import CIAOGTI, CIAOEvents, CIAOLightCurve, CIAOWorkflowError
+from xray_tools import (
+    CIAOGTI,
+    CIAOEvents,
+    CIAOLightCurve,
+    CIAOWorkflowError,
+    merge_events,
+)
 
 
 class FakeColumn:
@@ -172,6 +178,129 @@ def test_lightcurve_rejects_non_positive_binsize() -> None:
         CIAOEvents("evt2.fits").lightcurve("background.lc", binsize=0)
 
 
+def test_lightcurve_creates_missing_output_directories(event_file: Path) -> None:
+    output = event_file.parent / "sub" / "dir" / "background.lc"
+    runtool = Mock()
+
+    with patch("xray_tools.events.require_ciao_runtool", return_value=runtool):
+        result = CIAOEvents(event_file).lightcurve(output, clobber=True)
+
+    assert result == CIAOLightCurve(output)
+    assert output.parent.is_dir()
+    runtool.dmextract.assert_called_once_with(
+        infile=f"{event_file}[bin time=::259.28]",
+        outfile=str(output),
+        opt="ltc1",
+        clobber=True,
+    )
+
+
+def test_fluximage_serializes_energy_intervals(event_file: Path) -> None:
+    runtool = Mock()
+    outroot = event_file.parent / "ss433"
+    discovered = {"0.5-2": object(), "2-7": object()}
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.events._discover_flux_images", return_value=discovered),
+    ):
+        result = CIAOEvents(event_file).fluximage(
+            outroot,
+            energy=[(0.5, 2.0), (2.0, 7.0)],
+            binsize=4,
+            clobber=True,
+        )
+
+    kwargs = runtool.fluximage.call_args.kwargs
+    assert kwargs["infile"] == str(event_file)
+    assert kwargs["outroot"] == str(outroot)
+    assert kwargs["bands"] == "0.5:2:1,2:7:3.74166"
+    assert kwargs["binsize"] == 4
+    assert kwargs["clobber"] is True
+    assert kwargs["units"] == "default"
+    assert result is discovered
+
+
+def test_fluximage_passes_bands_through_verbatim(event_file: Path) -> None:
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.events._discover_flux_images", return_value={"broad": object()}),
+    ):
+        CIAOEvents(event_file).fluximage("ss433", bands="csc,broad")
+
+    kwargs = runtool.fluximage.call_args.kwargs
+    assert kwargs["bands"] == "csc,broad"
+    assert "binsize" not in kwargs
+
+
+def test_fluximage_uses_the_lazy_dm_expression(event_file: Path) -> None:
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.events._discover_flux_images", return_value={"broad": object()}),
+    ):
+        CIAOEvents(event_file).energy(2500, 7000).fluximage("ss433")
+
+    assert runtool.fluximage.call_args.kwargs["infile"] == (
+        f"{event_file}[energy=2500:7000]"
+    )
+
+
+def test_fluximage_rejects_energy_and_bands_together(event_file: Path) -> None:
+    with pytest.raises(ValueError, match="either energy or bands"):
+        CIAOEvents(event_file).fluximage("ss433", energy=(0.5, 7.0), bands="broad")
+
+
+@pytest.mark.parametrize(
+    "energy",
+    [(2.0, 0.5), (0.0, 7.0), (-1.0, 7.0), [(0.5, 2.0), (7.0, 2.0)]],
+)
+def test_fluximage_rejects_invalid_energy_intervals(
+    event_file: Path,
+    energy,
+) -> None:
+    runtool = Mock()
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        pytest.raises(ValueError, match="0 < lo < hi"),
+    ):
+        CIAOEvents(event_file).fluximage("ss433", energy=energy)
+    runtool.fluximage.assert_not_called()
+
+
+def test_fluximage_creates_missing_outroot_directories(
+    event_file: Path,
+    tmp_path: Path,
+) -> None:
+    runtool = Mock()
+    prefix = tmp_path / "new" / "ss433"
+    directory = tmp_path / "outdir"
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.events._discover_flux_images", return_value={"broad": object()}),
+    ):
+        CIAOEvents(event_file).fluximage(prefix)
+        CIAOEvents(event_file).fluximage(f"{directory}/")
+
+    assert prefix.parent.is_dir()
+    assert directory.is_dir()
+
+
+def test_fluximage_raises_when_nothing_was_created(event_file: Path) -> None:
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.events._discover_flux_images", return_value={}),
+        pytest.raises(CIAOWorkflowError, match="no flux images"),
+    ):
+        CIAOEvents(event_file).fluximage("ss433")
+
+
 def test_to_crate_reads_the_lazy_expression(event_file: Path) -> None:
     crate = object()
     pycrates = Mock()
@@ -242,3 +371,46 @@ def test_to_pandas_expands_vectors_when_columns_are_not_given(
 def test_to_pandas_rejects_empty_column_selection(event_file: Path) -> None:
     with pytest.raises(ValueError, match="at least one"):
         CIAOEvents(event_file).to_pandas(columns=())
+
+
+def test_merge_events_stacks_inputs_in_order(event_file: Path, tmp_path: Path) -> None:
+    other = tmp_path / "other_evt2.fits"
+    other.touch()
+    output = tmp_path / "merged" / "merged_evt2.fits"
+    runtool = Mock()
+    selected = CIAOEvents(event_file).energy(500, 7000)
+
+    with patch("xray_tools.events.require_ciao_runtool", return_value=runtool):
+        result = merge_events([selected, other], output, clobber=True)
+
+    runtool.dmmerge.assert_called_once_with(
+        infile=f"{event_file}[energy=500:7000],{other}",
+        outfile=str(output),
+        clobber=True,
+    )
+    assert result == CIAOEvents(output)
+    assert output.parent.is_dir()
+
+
+def test_merge_events_requires_at_least_one_input(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        merge_events([], tmp_path / "merged.fits")
+
+
+def test_merge_events_validates_input_files(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="event file"):
+        merge_events([tmp_path / "missing.fits"], tmp_path / "merged.fits")
+
+
+def test_merge_events_refuses_implicit_overwrite(event_file: Path) -> None:
+    output = event_file.parent / "merged.fits"
+    output.touch()
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        pytest.raises(FileExistsError, match="already exists"),
+    ):
+        merge_events([event_file], output)
+
+    runtool.dmmerge.assert_not_called()

@@ -1,13 +1,14 @@
 """Utilities and data models for X-ray observatory analysis."""
 
 from .chandra import ChandraACIS
-from .events import CIAOEvents
+from .events import CIAOEvents, merge_events
 from .exceptions import CIAOWorkflowError
 from .observation import Observation
-from .products import CIAOGTI, CIAOLightCurve, LightCurveCuts
+from .products import CIAOFluxImage, CIAOGTI, CIAOLightCurve, LightCurveCuts
 from .units import energy_to_wavelength, wavelength_to_energy
 
 __all__ = [
+    "CIAOFluxImage",
     "CIAOGTI",
     "CIAOEvents",
     "CIAOLightCurve",
@@ -16,6 +17,7 @@ __all__ = [
     "LightCurveCuts",
     "Observation",
     "energy_to_wavelength",
+    "merge_events",
     "wavelength_to_energy",
 ]
 

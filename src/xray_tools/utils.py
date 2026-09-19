@@ -54,10 +54,17 @@ def require_file(path: Path, description: str) -> None:
         raise FileNotFoundError(f"{description} does not exist: {path}")
 
 
-def prepare_output_path(outfile: str | Path, *, clobber: bool) -> Path:
-    """Validate an output location without creating implicit directories."""
+def prepare_output_path(
+    outfile: str | Path,
+    *,
+    clobber: bool,
+    create_parents: bool = False,
+) -> Path:
+    """Validate an output location, optionally creating missing directories."""
     path = Path(outfile)
-    if not path.parent.is_dir():
+    if create_parents:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    elif not path.parent.is_dir():
         raise FileNotFoundError(f"output directory does not exist: {path.parent}")
     if path.exists() and not clobber:
         raise FileExistsError(f"output file already exists: {path}")

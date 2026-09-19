@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .exceptions import CIAOWorkflowError
+from .products import _discover_flux_images
 from .utils import (
     prepare_output_path,
     require_ciao_runtool,
@@ -18,7 +21,7 @@ from .utils import (
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .products import CIAOGTI, CIAOLightCurve
+    from .products import CIAOFluxImage, CIAOGTI, CIAOLightCurve
 
 
 logger = logging.getLogger("xray_tools")
@@ -153,7 +156,7 @@ class CIAOEvents:
             raise ValueError("binsize must be positive")
 
         require_file(self.filename, "event file")
-        output = prepare_output_path(outfile, clobber=clobber)
+        output = prepare_output_path(outfile, clobber=clobber, create_parents=True)
         infile = f"{self.dm}[bin time=::{binsize}]"
         runtool = require_ciao_runtool()
 
@@ -167,6 +170,160 @@ class CIAOEvents:
         )
 
         return CIAOLightCurve(output)
+
+    def fluximage(
+        self,
+        outroot: str | Path,
+        *,
+        energy: tuple[float, float] | list[tuple[float, float]] | None = None,
+        bands: str | None = None,
+        binsize: float | None = None,
+        xygrid: str | None = None,
+        units: str = "default",
+        expmapthresh: str = "1.5%",
+        psfecf: float | None = None,
+        asolfile: str | None = None,
+        badpixfile: str | None = None,
+        maskfile: str | None = None,
+        dtffile: str | None = None,
+        background: str | None = None,
+        parallel: bool = True,
+        nproc: int | None = None,
+        cleanup: bool = True,
+        verbose: int = 1,
+        clobber: bool = False,
+    ) -> dict[str, CIAOFluxImage]:
+        """Create exposure-corrected images with CIAO's ``fluximage`` script.
+
+        ``energy`` selects one or more custom keV intervals; each interval is
+        serialized to CIAO's ``lo:hi:eff`` syntax with the effective energy
+        set to the geometric mean of the bounds. ``bands`` passes CIAO's band
+        syntax through verbatim (band names such as ``"csc"``, explicit
+        ``"lo:hi:eff"`` ranges, or spectral-weights files). The two options
+        are mutually exclusive.
+
+        The lazy event view is used directly as the input, so filters apply
+        to the images as well. ``outroot`` follows the fluximage convention:
+        a trailing ``/`` writes into that directory, otherwise it is a file
+        prefix; missing directories are created. Returns the products created
+        by this run, mapped by band label.
+        """
+        require_file(self.filename, "event file")
+        if energy is not None and bands is not None:
+            raise ValueError("pass either energy or bands, not both")
+        bands_value = _serialize_energy_bands(energy) if energy is not None else bands
+
+        raw = str(outroot)
+        if raw.endswith("/"):
+            Path(raw).mkdir(parents=True, exist_ok=True)
+        else:
+            Path(raw).parent.mkdir(parents=True, exist_ok=True)
+
+        options: dict[str, Any] = {}
+        if bands_value is not None:
+            options["bands"] = bands_value
+        if binsize is not None:
+            options["binsize"] = binsize
+        if xygrid is not None:
+            options["xygrid"] = xygrid
+        if psfecf is not None:
+            options["psfecf"] = psfecf
+        if asolfile is not None:
+            options["asolfile"] = asolfile
+        if badpixfile is not None:
+            options["badpixfile"] = badpixfile
+        if maskfile is not None:
+            options["maskfile"] = maskfile
+        if dtffile is not None:
+            options["dtffile"] = dtffile
+        if background is not None:
+            options["background"] = background
+        if nproc is not None:
+            options["nproc"] = nproc
+
+        runtool = require_ciao_runtool()
+        logger.info("fluximage: %s", self.dm)
+        logger.info("outroot: %s", raw)
+        started = time.time()
+        runtool.fluximage(
+            infile=self.dm,
+            outroot=raw,
+            units=units,
+            expmapthresh=expmapthresh,
+            parallel=parallel,
+            cleanup=cleanup,
+            verbose=verbose,
+            clobber=clobber,
+            **options,
+        )
+
+        images = _discover_flux_images(raw, since=started)
+        if not images:
+            raise CIAOWorkflowError(f"fluximage created no flux images for outroot: {raw}")
+        return images
+
+
+def merge_events(
+    events: Sequence[CIAOEvents | str | Path],
+    outfile: str | Path,
+    *,
+    clobber: bool = False,
+) -> CIAOEvents:
+    """Merge event files or lazy event views into one file with ``dmmerge``.
+
+    Inputs are merged in order. Lazy :class:`CIAOEvents` views contribute
+    their Data Model expression, so their filters apply to the merged
+    output. Returns the merged file as a new :class:`CIAOEvents`.
+    """
+    if not events:
+        raise ValueError("events must contain at least one input")
+
+    infiles = []
+    for item in events:
+        if isinstance(item, CIAOEvents):
+            require_file(item.filename, "event file")
+            infiles.append(item.dm)
+        else:
+            path = Path(item)
+            require_file(path, "event file")
+            infiles.append(str(path))
+
+    output = prepare_output_path(outfile, clobber=clobber, create_parents=True)
+    runtool = require_ciao_runtool()
+    infile = ",".join(infiles)
+
+    logger.info("dmmerge: %s", infile)
+    logger.info("output: %s", output)
+    runtool.dmmerge(
+        infile=infile,
+        outfile=str(output),
+        clobber=clobber,
+    )
+    return CIAOEvents(output)
+
+
+def _serialize_energy_bands(
+    energy: tuple[float, float] | list[tuple[float, float]],
+) -> str:
+    """Serialize custom keV interval(s) to CIAO's ``lo:hi:eff`` band syntax.
+
+    The effective energy is the geometric mean of the interval bounds.
+    """
+    intervals = [energy] if isinstance(energy, tuple) else list(energy)
+    if not intervals:
+        raise ValueError("energy must contain at least one (lo, hi) interval")
+
+    parts = []
+    for interval in intervals:
+        try:
+            lo, hi = interval
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"energy intervals must be (lo, hi) pairs: {interval!r}") from exc
+        if not 0 < lo < hi:
+            raise ValueError(f"energy intervals must satisfy 0 < lo < hi: {interval!r}")
+        eff = (lo * hi) ** 0.5
+        parts.append(f"{lo:g}:{hi:g}:{eff:.6g}")
+    return ",".join(parts)
 
 
 def _column_components(name: str) -> tuple[str, ...]:
@@ -216,8 +373,8 @@ def _format_filters(filters: tuple[str, ...]) -> str:
                 raise CIAOWorkflowError(
                     f"cannot compose CCD filter with region exclusion: {expression}"
                 ) from exc
-
-            unselected = sorted(set(range(10)) - selected)
+            all_ccd = set(range(10))
+            unselected = sorted(all_ccd - selected)
             if unselected:
                 terms.append(f"ccd_id={','.join(map(str, unselected))}")
             continue

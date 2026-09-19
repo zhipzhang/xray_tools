@@ -33,6 +33,14 @@ lightcurve.plot(gti=gti, title="SS 433 background")  # shaded good times, cut le
 print(gti.cuts)           # count-rate limits lc_clean applied
 
 events.apply_gti(gti).write("products/clean_evt2.fits", clobber=True)
+
+images = events.fluximage(
+    "products/ss433",      # trailing "/" would write into a directory instead
+    energy=(0.5, 7.0),     # custom band; effective energy = sqrt(lo * hi)
+    binsize=4,
+    clobber=True,
+)
+images["0.5-7"].flux       # products/ss433_0.5-7_flux.img
 ```
 
 CIAO and `pycrates` are loaded only when an operation needs them, so the package

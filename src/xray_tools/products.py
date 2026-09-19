@@ -289,3 +289,171 @@ class CIAOGTI:
         if title is not None:
             ax.set_title(title)
         return ax
+
+
+@dataclass(frozen=True)
+class CIAOFluxImage:
+    """Exposure-corrected image products for one energy band."""
+
+    band: str
+    counts: Path | None
+    flux: Path
+    exposure: Path | None
+    fov: Path | None
+    psf: Path | None
+
+    def __post_init__(self) -> None:
+        for field in ("counts", "flux", "exposure", "fov", "psf"):
+            value = getattr(self, field)
+            if value is not None:
+                object.__setattr__(self, field, Path(value))
+
+    def plot(
+        self,
+        ax: Axes | None = None,
+        *,
+        component: str = "flux",
+        stretch: str = "log",
+        cmap: str = "inferno",
+        smooth: float | None = None,
+        title: str | None = None,
+    ) -> Axes:
+        """Display one of the image products with Matplotlib.
+
+        ``component`` selects which file is shown: ``"flux"`` (the default),
+        ``"counts"``, ``"exposure"``, or ``"psf"``. The display stretch is
+        ``"log"``, ``"sqrt"``, or ``"linear"``; non-positive values are
+        masked for the logarithmic stretch. ``smooth`` gives the sigma of a
+        Gaussian kernel, in image pixels, applied for display only. When this
+        method creates the axes itself, the image's celestial WCS is used to
+        label the axes with RA and Dec.
+        """
+        import numpy as np
+        from astropy.io import fits
+        from astropy.visualization import (
+            ImageNormalize,
+            LinearStretch,
+            LogStretch,
+            SqrtStretch,
+        )
+
+        paths = {
+            "flux": self.flux,
+            "counts": self.counts,
+            "exposure": self.exposure,
+            "psf": self.psf,
+        }
+        if component not in paths:
+            raise ValueError(f"unknown image component: {component!r}")
+        if paths[component] is None:
+            raise ValueError(f"the {component} image is not available for this band")
+
+        stretches = {"linear": LinearStretch, "sqrt": SqrtStretch, "log": LogStretch}
+        if stretch not in stretches:
+            raise ValueError(f"stretch must be one of {sorted(stretches)}")
+        if smooth is not None and smooth <= 0:
+            raise ValueError("smooth must be positive")
+
+        require_file(paths[component], f"{component} image")
+        with fits.open(paths[component]) as hdul:
+            data = np.asarray(hdul[0].data, dtype=float)
+            header = hdul[0].header.copy()
+
+        data = np.where(np.isfinite(data), data, np.nan)
+        if smooth is not None:
+            from astropy.convolution import Gaussian2DKernel, convolve
+
+            data = convolve(
+                data,
+                Gaussian2DKernel(smooth),
+                normalize_kernel=True,
+                boundary="extend",
+            )
+        if stretch == "log":
+            data = np.where(data > 0, data, np.nan)
+        finite = data[np.isfinite(data)]
+        if finite.size == 0:
+            raise ValueError(f"the {component} image has no displayable data")
+
+        if ax is None:
+            import matplotlib.pyplot as plt
+
+            projection = None
+            try:
+                from astropy.wcs import WCS
+
+                wcs = WCS(header)
+                if wcs.has_celestial:
+                    projection = wcs
+            except Exception:
+                projection = None
+            if projection is None:
+                _, ax = plt.subplots()
+                ax.set_xlabel("Sky X (pixel)")
+                ax.set_ylabel("Sky Y (pixel)")
+            else:
+                _, ax = plt.subplots(subplot_kw={"projection": projection})
+
+        norm = ImageNormalize(
+            vmin=finite.min(),
+            vmax=finite.max(),
+            stretch=stretches[stretch](),
+            clip=False,
+        )
+        image = ax.imshow(data, origin="lower", cmap=cmap, norm=norm)
+        labels = {
+            "flux": r"photon cm$^{-2}$ s$^{-1}$",
+            "counts": "counts",
+            "exposure": r"cm$^2$ s count photon$^{-1}$",
+            "psf": "arcsec",
+        }
+        ax.figure.colorbar(image, ax=ax, label=labels[component])
+        if title is not None:
+            ax.set_title(title)
+        return ax
+
+
+def _discover_flux_images(outroot: str | Path, *, since: float) -> dict[str, CIAOFluxImage]:
+    """Map band labels to the fluximage products created after ``since``.
+
+    Only files newer than the given timestamp are considered, so products
+    from earlier runs with the same outroot are left out.
+    """
+    raw = str(outroot)
+    directory_style = raw.endswith("/")
+    base = Path(raw) if directory_style else Path(raw).parent
+    prefix = "" if directory_style else Path(raw).name
+
+    def fresh(path: Path) -> bool:
+        return path.is_file() and path.stat().st_mtime >= since - 1.0
+
+    def first_fresh(*names: str) -> Path | None:
+        for name in names:
+            candidate = base / name
+            if fresh(candidate):
+                return candidate
+        return None
+
+    def label_of(flux_name: str) -> str:
+        stem = flux_name[: -len("_flux.img")]
+        return stem.removeprefix(f"{prefix}_") if prefix else stem
+
+    flux_pattern = "*_flux.img" if not prefix else f"{prefix}_*_flux.img"
+    fov_pattern = "*.fov" if not prefix else f"{prefix}_*.fov"
+
+    images: dict[str, CIAOFluxImage] = {}
+    for flux in sorted(base.glob(flux_pattern)):
+        if not fresh(flux):
+            continue
+        stem = flux.name[: -len("_flux.img")]
+        fovs = [path for path in sorted(base.glob(fov_pattern)) if fresh(path)]
+        band = label_of(flux.name)
+        images[band] = CIAOFluxImage(
+            band=band,
+            counts=first_fresh(f"{stem}_thresh.img", f"{stem}.img"),
+            flux=flux,
+            exposure=first_fresh(f"{stem}_thresh.expmap", f"{stem}.expmap"),
+            fov=fovs[0] if fovs else None,
+            psf=first_fresh(f"{stem}_thresh.psfmap", f"{stem}.psfmap"),
+        )
+    return images
