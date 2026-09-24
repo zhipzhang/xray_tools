@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ from .utils import (
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .products import CIAOGTI, CIAOFluxImage, CIAOLightCurve
+    from .products import CIAOGTI, CIAOBlankSky, CIAOFluxImage, CIAOLightCurve
 
 
 logger = logging.getLogger("xray_tools")
@@ -261,6 +262,74 @@ class CIAOEvents:
         if not images:
             raise CIAOWorkflowError(f"fluximage created no flux images for outroot: {raw}")
         return images
+
+    def blanksky(
+        self,
+        outfile: str | Path,
+        *,
+        asolfile: str | Path | Sequence[str | Path] | None = None,
+        stowedbg: bool = False,
+        weight_method: str = "particle",
+        bkgparams: str = "default",
+        random: int = 0,
+        tmpdir: str | Path | None = None,
+        verbose: int = 0,
+        clobber: bool = False,
+    ) -> CIAOBlankSky:
+        """Tailor a CalDB blank-sky background event file to this observation.
+
+        ``weight_method`` selects the background normalization: ``"particle"``
+        (default) scales by high-energy particle counts, ``"time"`` by exposure
+        time, and ``"particle-rate"`` by particle count rates. ``bkgparams`` is
+        the Data Model filter used for the particle-based methods — ``"default"``
+        lets CIAO pick (``[energy=9000:12000]`` for ACIS, ``[pi=300:500]`` for
+        HRC) — or an explicit ``"[energy=lo:hi]"`` / ``"[pi=lo:hi]"`` filter.
+        ``asolfile`` may be a path or a sequence of paths; when omitted, CIAO
+        looks the aspect solution up from the event file header. Requires the
+        CalDB blank-sky background files to be installed.
+        """
+        from .products.blanksky import CIAOBlankSky
+
+        methods = ("particle", "time", "particle-rate")
+        if weight_method not in methods:
+            raise ValueError(f"weight_method must be one of {sorted(methods)}")
+        if bkgparams != "default" and re.fullmatch(
+            r"\[(energy|pi)=\d+:\d+\]", bkgparams
+        ) is None:
+            raise ValueError(
+                'bkgparams must be "default" or a filter like "[energy=9000:12000]"'
+            )
+
+        require_file(self.filename, "event file")
+        output = prepare_output_path(outfile, clobber=clobber, create_parents=True)
+
+        options: dict[str, Any] = {}
+        if asolfile is not None:
+            if isinstance(asolfile, (str, Path)):
+                asol_files = (asolfile,)
+            else:
+                asol_files = tuple(asolfile)
+            for path in asol_files:
+                require_file(Path(path), "aspect solution file")
+            options["asolfile"] = ",".join(str(path) for path in asol_files)
+        if tmpdir is not None:
+            options["tmpdir"] = str(tmpdir)
+
+        runtool = require_ciao_runtool()
+        logger.info("blanksky: %s", self.dm)
+        logger.info("output: %s", output)
+        runtool.blanksky(
+            evtfile=self.dm,
+            outfile=str(output),
+            stowedbg=stowedbg,
+            weight_method=weight_method,
+            bkgparams=bkgparams,
+            random=random,
+            verbose=verbose,
+            clobber=clobber,
+            **options,
+        )
+        return CIAOBlankSky(output)
 
 
 def merge_events(

@@ -43,6 +43,11 @@ images = events.fluximage(
 images["0.5-7"].flux.plot()                    # log stretch, WCS axes, BUNIT colorbar
 images["0.5-7"].counts.to_numpy(masked=True)   # MaskedArray; NaN pixels carry no data
 images["0.5-7"].flux.path                      # products/ss433_0.5-7_flux.img
+
+blank = events.blanksky("products/3843_blank_evt.fits", clobber=True)
+blank.method, blank.scales          # "particle", {0: 0.039, 1: 0.041, ...} per chip
+bgs = blank.images("products/ss433_bkg", images["0.5-7"].counts)
+bgs.subtracted.plot()               # background-subtracted counts image
 ```
 
 CIAO and `pycrates` are loaded only when an operation needs them, so the package

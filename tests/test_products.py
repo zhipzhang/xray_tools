@@ -9,6 +9,8 @@ import pytest
 
 from xray_tools import (
     CIAOGTI,
+    CIAOBlankSky,
+    CIAOBlankSkyImage,
     CIAOFluxImage,
     CIAOImage,
     CIAOLightCurve,
@@ -614,3 +616,154 @@ def test_flux_image_plot_rejects_non_positive_smoothing(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="smooth must be positive"):
         product.plot(ax=Mock(), smooth=0.0)
+
+
+def _key_crate(keys: dict) -> Mock:
+    crate = Mock()
+    crate.get_keynames.return_value = list(keys)
+    crate.get_key_value.side_effect = lambda name: keys.get(name)
+    return crate
+
+
+_BLANK_KEYS = {
+    "BKGMETH": "particle",
+    "BKGPARAM": "[energy=9000:12000]",
+    "BKGSCAL0": 0.0394,
+    "BKGSCAL1": 0.0406,
+    "BKGSCAL7": 0.1758,
+}
+
+
+def test_blanksky_exposes_scaling_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "blank_evt.fits"
+    path.touch()
+    crate = _key_crate(_BLANK_KEYS)
+    blank = CIAOBlankSky(path)
+
+    with patch("xray_tools.products.blanksky.require_pycrates", return_value=fake_pycrates(crate)):
+        method = blank.method
+        bkgparams = blank.bkgparams
+        scales = blank.scales
+
+    assert method == "particle"
+    assert bkgparams == "[energy=9000:12000]"
+    assert scales == {0: 0.0394, 1: 0.0406, 7: 0.1758}
+
+
+def test_blanksky_scales_empty_for_single_chip_files(tmp_path: Path) -> None:
+    path = tmp_path / "hrc_blank.fits"
+    path.touch()
+    crate = _key_crate({"BKGMETH": "particle", "BKGSCALE": 0.5})
+    blank = CIAOBlankSky(path)
+
+    with patch("xray_tools.products.blanksky.require_pycrates", return_value=fake_pycrates(crate)):
+        scales = blank.scales
+
+    assert scales == {}
+
+
+def test_blanksky_method_requires_a_tailored_file(tmp_path: Path) -> None:
+    path = tmp_path / "plain_evt.fits"
+    path.touch()
+    crate = _key_crate({})
+
+    with (
+        patch("xray_tools.products.blanksky.require_pycrates", return_value=fake_pycrates(crate)),
+        pytest.raises(ValueError, match="BKGMETH"),
+    ):
+        _ = CIAOBlankSky(path).method
+
+
+def test_blanksky_images_run_blanksky_image_and_collect_outputs(
+    tmp_path: Path,
+) -> None:
+    bkg = tmp_path / "blank_evt.fits"
+    bkg.touch()
+    reference = tmp_path / "0.5-7_thresh.img"
+    reference.touch()
+    outroot = tmp_path / "obs_bkg"
+    crate = _key_crate({"BKGMETH": "particle"})
+
+    def fake_run(**_kwargs):
+        for suffix in ("bgnd", "bkgsub"):
+            (tmp_path / f"obs_bkg_particle_{suffix}.img").touch()
+
+    runtool = Mock()
+    runtool.blanksky_image.side_effect = fake_run
+
+    with (
+        patch("xray_tools.products.blanksky.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.products.blanksky.require_pycrates", return_value=fake_pycrates(crate)),
+    ):
+        result = CIAOBlankSky(bkg).images(outroot, reference, verbose=2, clobber=True)
+
+    kwargs = runtool.blanksky_image.call_args.kwargs
+    assert kwargs["bkgfile"] == str(bkg)
+    assert kwargs["outroot"] == str(outroot)
+    assert kwargs["imgfile"] == str(reference)
+    assert kwargs["verbose"] == 2
+    assert kwargs["clobber"] is True
+    assert result == CIAOBlankSkyImage(
+        background=tmp_path / "obs_bkg_particle_bgnd.img",
+        subtracted=tmp_path / "obs_bkg_particle_bkgsub.img",
+    )
+    assert isinstance(result.background, CIAOImage)
+    assert isinstance(result.subtracted, CIAOImage)
+
+
+def test_blanksky_images_accept_a_ciao_image_reference(tmp_path: Path) -> None:
+    bkg = tmp_path / "blank_evt.fits"
+    bkg.touch()
+    reference = tmp_path / "counts.img"
+    reference.touch()
+    crate = _key_crate({"BKGMETH": "particle"})
+    runtool = Mock()
+
+    def fake_run(**_kwargs):
+        for suffix in ("bgnd", "bkgsub"):
+            (tmp_path / f"obs_particle_{suffix}.img").touch()
+
+    runtool.blanksky_image.side_effect = fake_run
+
+    with (
+        patch("xray_tools.products.blanksky.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.products.blanksky.require_pycrates", return_value=fake_pycrates(crate)),
+    ):
+        CIAOBlankSky(bkg).images(tmp_path / "obs", CIAOImage(reference))
+
+    assert runtool.blanksky_image.call_args.kwargs["imgfile"] == str(reference)
+
+
+def test_blanksky_images_raise_when_outputs_are_missing(tmp_path: Path) -> None:
+    bkg = tmp_path / "blank_evt.fits"
+    bkg.touch()
+    reference = tmp_path / "counts.img"
+    reference.touch()
+    crate = _key_crate({"BKGMETH": "particle"})
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.products.blanksky.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.products.blanksky.require_pycrates", return_value=fake_pycrates(crate)),
+        pytest.raises(CIAOWorkflowError, match="no bgnd image"),
+    ):
+        CIAOBlankSky(bkg).images(tmp_path / "obs", reference)
+
+
+def test_blanksky_images_refuse_implicit_overwrite(tmp_path: Path) -> None:
+    bkg = tmp_path / "blank_evt.fits"
+    bkg.touch()
+    reference = tmp_path / "counts.img"
+    reference.touch()
+    (tmp_path / "obs_particle_bgnd.img").touch()
+    crate = _key_crate({"BKGMETH": "particle"})
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.products.blanksky.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.products.blanksky.require_pycrates", return_value=fake_pycrates(crate)),
+        pytest.raises(FileExistsError, match="already exists"),
+    ):
+        CIAOBlankSky(bkg).images(tmp_path / "obs", reference)
+
+    runtool.blanksky_image.assert_not_called()

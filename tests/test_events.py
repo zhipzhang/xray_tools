@@ -6,6 +6,7 @@ import pytest
 
 from xray_tools import (
     CIAOGTI,
+    CIAOBlankSky,
     CIAOEvents,
     CIAOLightCurve,
     CIAOWorkflowError,
@@ -414,3 +415,126 @@ def test_merge_events_refuses_implicit_overwrite(event_file: Path) -> None:
         merge_events([event_file], output)
 
     runtool.dmmerge.assert_not_called()
+
+
+def test_blanksky_calls_the_blanksky_tool(event_file: Path, tmp_path: Path) -> None:
+    output = event_file.parent / "blank" / "bkg_evt.fits"
+    asol1 = tmp_path / "asol1.fits"
+    asol2 = tmp_path / "asol2.fits"
+    asol1.touch()
+    asol2.touch()
+    runtool = Mock()
+
+    with patch("xray_tools.events.require_ciao_runtool", return_value=runtool):
+        result = CIAOEvents(event_file).blanksky(
+            output,
+            asolfile=[asol1, asol2],
+            weight_method="particle-rate",
+            bkgparams="[energy=8000:11000]",
+            random=42,
+            tmpdir=tmp_path,
+            verbose=2,
+            clobber=True,
+        )
+
+    runtool.blanksky.assert_called_once_with(
+        evtfile=str(event_file),
+        outfile=str(output),
+        stowedbg=False,
+        weight_method="particle-rate",
+        bkgparams="[energy=8000:11000]",
+        random=42,
+        verbose=2,
+        clobber=True,
+        asolfile=f"{asol1},{asol2}",
+        tmpdir=str(tmp_path),
+    )
+    assert result == CIAOBlankSky(output)
+    assert output.parent.is_dir()
+
+
+def test_blanksky_uses_the_lazy_dm_expression(event_file: Path) -> None:
+    runtool = Mock()
+
+    with patch("xray_tools.events.require_ciao_runtool", return_value=runtool):
+        CIAOEvents(event_file).energy(2500, 7000).blanksky("bkg_evt.fits", clobber=True)
+
+    kwargs = runtool.blanksky.call_args.kwargs
+    assert kwargs["evtfile"] == f"{event_file}[energy=2500:7000]"
+    assert kwargs["stowedbg"] is False
+    assert kwargs["weight_method"] == "particle"
+    assert kwargs["bkgparams"] == "default"
+    assert "asolfile" not in kwargs
+    assert "tmpdir" not in kwargs
+
+
+def test_blanksky_accepts_a_single_aspect_solution(event_file: Path, tmp_path: Path) -> None:
+    asol = tmp_path / "asol1.fits"
+    asol.touch()
+    runtool = Mock()
+
+    with patch("xray_tools.events.require_ciao_runtool", return_value=runtool):
+        CIAOEvents(event_file).blanksky("bkg_evt.fits", asolfile=asol)
+
+    assert runtool.blanksky.call_args.kwargs["asolfile"] == str(asol)
+
+
+@pytest.mark.parametrize("weight_method", ["particles", "rate", "PARTICLE"])
+def test_blanksky_rejects_unknown_weight_methods(
+    event_file: Path,
+    weight_method: str,
+) -> None:
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        pytest.raises(ValueError, match="weight_method"),
+    ):
+        CIAOEvents(event_file).blanksky("bkg_evt.fits", weight_method=weight_method)
+
+    runtool.blanksky.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "bkgparams",
+    ["[energy=abc]", "[time=1:2]", "9000:12000", "[pi=300:500:700]", "[energy=-1:5]"],
+)
+def test_blanksky_rejects_malformed_bkgparams(event_file: Path, bkgparams: str) -> None:
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        pytest.raises(ValueError, match="bkgparams"),
+    ):
+        CIAOEvents(event_file).blanksky("bkg_evt.fits", bkgparams=bkgparams)
+
+    runtool.blanksky.assert_not_called()
+
+
+@pytest.mark.parametrize("bkgparams", ["default", "[energy=9000:12000]", "[pi=300:500]"])
+def test_blanksky_accepts_valid_bkgparams(event_file: Path, bkgparams: str) -> None:
+    runtool = Mock()
+
+    with patch("xray_tools.events.require_ciao_runtool", return_value=runtool):
+        CIAOEvents(event_file).blanksky("bkg_evt.fits", bkgparams=bkgparams)
+
+    assert runtool.blanksky.call_args.kwargs["bkgparams"] == bkgparams
+
+
+def test_blanksky_refuses_implicit_overwrite(event_file: Path) -> None:
+    output = event_file.parent / "bkg_evt.fits"
+    output.touch()
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        pytest.raises(FileExistsError, match="already exists"),
+    ):
+        CIAOEvents(event_file).blanksky(output)
+
+    runtool.blanksky.assert_not_called()
+
+
+def test_blanksky_requires_an_event_file(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="event file"):
+        CIAOEvents(tmp_path / "missing.fits").blanksky(tmp_path / "bkg_evt.fits")
