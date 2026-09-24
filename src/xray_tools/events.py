@@ -404,55 +404,78 @@ def _column_components(name: str) -> tuple[str, ...]:
     return tuple(component.strip() for component in name[start + 1 : -1].split(","))
 
 
+def _invert_filter(expression: str) -> str:
+    """Return the complement of a supported CIAO include filter.
+
+    Returns an empty string when the complement selects nothing, e.g. all
+    CCD IDs are already selected. Raises :class:`CIAOWorkflowError` for
+    filters whose complement cannot be expressed as a single CIAO filter.
+    """
+    if expression.startswith("energy="):
+        bounds = expression.removeprefix("energy=").split(":")
+        if len(bounds) != 2 or not all(bounds):
+            raise CIAOWorkflowError(f"cannot invert energy filter: {expression}")
+
+        lower, upper = bounds
+
+        # energy=500:7000  ->  energy=:500,7000:
+        return f"energy=:{lower},{upper}:"
+
+    if expression.startswith("ccd_id="):
+        try:
+            selected = {
+                int(value) for value in expression.removeprefix("ccd_id=").split(",")
+            }
+        except ValueError as exc:
+            raise CIAOWorkflowError(f"cannot invert CCD filter: {expression}") from exc
+
+        unselected = sorted(set(range(10)) - selected)
+        if not unselected:
+            return ""
+        return f"ccd_id={','.join(map(str, unselected))}"
+
+    raise CIAOWorkflowError(
+        "CIAO cannot compose an excluded region with filter "
+        f"{expression!r}. Materialize that selection with write() "
+        "before applying exclude_region()."
+    )
+
+
 def _format_filters(filters: tuple[str, ...]) -> str:
-    """Serialize filters, accounting for CIAO's exclude-filter restriction."""
-    excluded = tuple(
+    """Serialize a set of lazy CIAO filters.
+
+    CIAO cannot mix normal filters with ``exclude`` filters directly.
+    When exclusions are present, rewrite
+
+        include A AND include B AND NOT C
+
+    as
+
+        NOT (NOT A OR NOT B OR C)
+
+    and express the result as one CIAO ``exclude`` filter.
+    """
+    excluded = [
         expression.removeprefix("exclude ")
         for expression in filters
         if expression.startswith("exclude ")
-    )
-    if not excluded:
-        return "".join(f"[{expression}]" for expression in filters)
-
-    included = tuple(
+    ]
+    included = [
         expression for expression in filters if not expression.startswith("exclude ")
-    )
+    ]
+
+    # Normal case: no exclusions, so filters can simply be chained.
+    if not excluded:
+        return "".join(f"[{expression}]" for expression in included)
+
+    # A lone exclusion needs no complement rewrite.
     if not included and len(excluded) == 1:
         return f"[exclude {excluded[0]}]"
 
-    terms = list(excluded)
-    for expression in included:
-        if expression.startswith("energy="):
-            bounds = expression.removeprefix("energy=").split(":")
-            if len(bounds) != 2 or not all(bounds):
-                raise CIAOWorkflowError(
-                    f"cannot compose energy filter with region exclusion: {expression}"
-                )
-            lower, upper = bounds
-            terms.append(f"energy=:{lower},{upper}:")
-            continue
-
-        if expression.startswith("ccd_id="):
-            try:
-                selected = {
-                    int(value)
-                    for value in expression.removeprefix("ccd_id=").split(",")
-                }
-            except ValueError as exc:
-                raise CIAOWorkflowError(
-                    f"cannot compose CCD filter with region exclusion: {expression}"
-                ) from exc
-            all_ccd = set(range(10))
-            unselected = sorted(all_ccd - selected)
-            if unselected:
-                terms.append(f"ccd_id={','.join(map(str, unselected))}")
-            continue
-
-        raise CIAOWorkflowError(
-            "CIAO cannot compose an excluded region with filter "
-            f"{expression!r}. Materialize that selection with write() "
-            "before applying exclude_region()."
-        )
+    # Convert included selections into events that must be excluded;
+    # an inversion may select nothing (all CCD IDs included) and is dropped.
+    inverted = [_invert_filter(expression) for expression in included]
+    terms = excluded + [term for term in inverted if term]
 
     compound = "||".join(f"({term})" for term in terms)
     return f"[exclude {compound}]"
