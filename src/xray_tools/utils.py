@@ -48,6 +48,19 @@ def require_lc_clean() -> Callable[..., Any]:
     return lc_clean
 
 
+def require_sherpa() -> Any:
+    """Return sherpa's astro I/O module or raise an actionable error."""
+    try:
+        from sherpa.astro import io
+    except ImportError as exc:
+        raise CIAOWorkflowError(
+            "sherpa is not available. "
+            "Run this operation inside a configured CIAO environment."
+        ) from exc
+
+    return io
+
+
 def require_file(path: Path, description: str) -> None:
     """Require a regular input file before invoking CIAO."""
     if not path.is_file():

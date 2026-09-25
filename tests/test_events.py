@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -538,3 +539,180 @@ def test_blanksky_refuses_implicit_overwrite(event_file: Path) -> None:
 def test_blanksky_requires_an_event_file(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="event file"):
         CIAOEvents(tmp_path / "missing.fits").blanksky(tmp_path / "bkg_evt.fits")
+
+
+def test_specextract_calls_the_specextract_tool(event_file: Path, tmp_path: Path) -> None:
+    src_region = tmp_path / "src.reg"
+    bkg_region = tmp_path / "bkg.reg"
+    src_region.touch()
+    bkg_region.touch()
+    outroot = tmp_path / "extract" / "spec"
+    runtool = Mock()
+    discovered = object()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.events._discover_spectrum", return_value=discovered),
+    ):
+        result = CIAOEvents(event_file).region(src_region).specextract(
+            outroot,
+            bkgfile=bkg_region,
+            weight=False,
+            correctpsf=True,
+            refcoord=(123.45, -12.34),
+            binspec=1,
+            verbose=2,
+            clobber=True,
+        )
+
+    runtool.specextract.assert_called_once_with(
+        infile=f"{event_file}[sky=region({src_region})]",
+        outroot=str(outroot),
+        weight=False,
+        weight_rmf=False,
+        correctpsf=True,
+        grouptype="NUM_CTS",
+        binspec=1,
+        bkg_grouptype="NONE",
+        bkg_binspec="NONE",
+        bkgresp=True,
+        energy="0.3:11.0:0.01",
+        channel="1:1024:1",
+        parallel=True,
+        verbose=2,
+        clobber=True,
+        bkgfile=f"{event_file}[sky=region({bkg_region})]",
+        refcoord="123.45 -12.34",
+    )
+    assert result is discovered
+    assert outroot.parent.is_dir()
+
+
+def test_specextract_accepts_events_and_blanksky_backgrounds(
+    event_file: Path,
+    tmp_path: Path,
+) -> None:
+    bkg_events = tmp_path / "bkg_evt.fits"
+    bkg_events.touch()
+    blank = tmp_path / "blank_evt.fits"
+    blank.touch()
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.events._discover_spectrum", return_value=object()),
+    ):
+        CIAOEvents(event_file).specextract(
+            "spec", bkgfile=CIAOEvents(bkg_events).energy(500, 7000)
+        )
+        CIAOEvents(event_file).specextract("spec", bkgfile=CIAOBlankSky(blank))
+
+    first, second = runtool.specextract.call_args_list
+    assert first.kwargs["bkgfile"] == f"{bkg_events}[energy=500:7000]"
+    assert first.kwargs["bkgresp"] is True
+    assert second.kwargs["bkgfile"] == str(blank)
+    assert second.kwargs["bkgresp"] is False
+
+
+def test_specextract_passes_refcoord_strings_through(event_file: Path) -> None:
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.events._discover_spectrum", return_value=object()),
+    ):
+        CIAOEvents(event_file).specextract("spec", refcoord="8:13:48,-12:20:24")
+
+    assert runtool.specextract.call_args.kwargs["refcoord"] == "8:13:48,-12:20:24"
+
+
+def test_specextract_none_grouping_disables_binspec(event_file: Path) -> None:
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.events._discover_spectrum", return_value=object()),
+    ):
+        CIAOEvents(event_file).specextract("spec", grouptype="none")
+
+    kwargs = runtool.specextract.call_args.kwargs
+    assert kwargs["grouptype"] == "NONE"
+    assert kwargs["binspec"] == "NONE"
+    assert "bkgfile" not in kwargs
+    assert "asp" not in kwargs
+
+
+def test_specextract_rejects_unknown_grouptypes(event_file: Path) -> None:
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        pytest.raises(ValueError, match="grouptype"),
+    ):
+        CIAOEvents(event_file).specextract("spec", grouptype="bogus")
+
+    runtool.specextract.assert_not_called()
+
+
+def test_specextract_requires_bkg_binspec_when_grouping_background(
+    event_file: Path,
+) -> None:
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        pytest.raises(ValueError, match="bkg_binspec"),
+    ):
+        CIAOEvents(event_file).specextract("spec", bkg_grouptype="NUM_CTS")
+
+    runtool.specextract.assert_not_called()
+
+
+def test_specextract_warns_without_a_region_filter(
+    event_file: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.events._discover_spectrum", return_value=object()),
+        caplog.at_level(logging.WARNING, logger="xray_tools"),
+    ):
+        CIAOEvents(event_file).specextract("spec")
+
+    assert "full-chip" in caplog.text
+
+
+def test_specextract_rejects_directory_style_outroots(event_file: Path) -> None:
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        pytest.raises(ValueError, match="file prefix"),
+    ):
+        CIAOEvents(event_file).specextract("spectrum/")
+
+    runtool.specextract.assert_not_called()
+
+
+def test_specextract_refuses_implicit_overwrite(event_file: Path, tmp_path: Path) -> None:
+    (tmp_path / "spec.pi").touch()
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.events.require_ciao_runtool", return_value=runtool),
+        pytest.raises(FileExistsError, match="already exists"),
+    ):
+        CIAOEvents(event_file).specextract(tmp_path / "spec")
+
+    runtool.specextract.assert_not_called()
+
+
+def test_specextract_validates_background_files(event_file: Path, tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="background region file"):
+        CIAOEvents(event_file).specextract("spec", bkgfile=tmp_path / "missing.reg")
+    with pytest.raises(FileNotFoundError, match="background event file"):
+        CIAOEvents(event_file).specextract(
+            "spec", bkgfile=CIAOEvents(tmp_path / "missing.fits")
+        )

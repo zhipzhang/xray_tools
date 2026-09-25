@@ -48,6 +48,17 @@ blank = events.blanksky("products/3843_blank_evt.fits", clobber=True)
 blank.method, blank.scales          # "particle", {0: 0.039, 1: 0.041, ...} per chip
 bgs = blank.images("products/ss433_bkg", images["0.5-7"].counts)
 bgs.subtracted.plot()               # background-subtracted counts image
+
+spec = events.region("src.reg").specextract(
+    "products/3c273",               # writes products/3c273.{pi,arf,rmf}, 3c273_bkg.pi, ...
+    bkgfile="bkg.reg",              # or a CIAOEvents / CIAOBlankSky background
+    weight=False,                   # point source: unweighted responses ...
+    correctpsf=True,                # ... with aperture-corrected ARF
+    grouptype="NUM_CTS", binspec=15,
+    clobber=True,
+)
+spec.counts, spec.exposure          # header metadata via pycrates
+pha = spec.to_sherpa()              # sherpa DataPHA; ARF/RMF/background auto-attached
 ```
 
 CIAO and `pycrates` are loaded only when an operation needs them, so the package

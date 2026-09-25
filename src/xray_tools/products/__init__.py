@@ -4,6 +4,7 @@ from .blanksky import CIAOBlankSky, CIAOBlankSkyImage
 from .gti import CIAOGTI, LightCurveCuts
 from .image import CIAOFluxImage, CIAOImage
 from .lightcurve import CIAOLightCurve
+from .spectrum import CIAOSpectrum
 
 __all__ = [
     "CIAOGTI",
@@ -12,5 +13,6 @@ __all__ = [
     "CIAOFluxImage",
     "CIAOImage",
     "CIAOLightCurve",
+    "CIAOSpectrum",
     "LightCurveCuts",
 ]

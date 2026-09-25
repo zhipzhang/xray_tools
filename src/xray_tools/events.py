@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from .exceptions import CIAOWorkflowError
 from .products.image import _discover_flux_images
+from .products.spectrum import _discover_spectrum
 from .utils import (
     prepare_output_path,
     require_ciao_runtool,
@@ -22,10 +23,30 @@ from .utils import (
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .products import CIAOGTI, CIAOBlankSky, CIAOFluxImage, CIAOLightCurve
+    from .products import (
+        CIAOGTI,
+        CIAOBlankSky,
+        CIAOFluxImage,
+        CIAOLightCurve,
+        CIAOSpectrum,
+    )
 
 
 logger = logging.getLogger("xray_tools")
+
+_GROUP_TYPES = (
+    "NONE",
+    "BIN",
+    "SNR",
+    "NUM_BINS",
+    "NUM_CTS",
+    "ADAPTIVE",
+    "ADAPTIVE_SNR",
+    "BIN_WIDTH",
+    "MIN_SLOPE",
+    "MAX_SLOPE",
+    "BIN_FILE",
+)
 
 
 @dataclass(frozen=True)
@@ -330,6 +351,145 @@ class CIAOEvents:
             **options,
         )
         return CIAOBlankSky(output)
+
+    def specextract(
+        self,
+        outroot: str | Path,
+        *,
+        bkgfile: CIAOEvents | CIAOBlankSky | str | Path | None = None,
+        weight: bool = True,
+        weight_rmf: bool = False,
+        correctpsf: bool = False,
+        refcoord: str | tuple[float, float] | None = None,
+        grouptype: str = "NUM_CTS",
+        binspec: str | int = 15,
+        bkg_grouptype: str = "NONE",
+        bkg_binspec: str | int | None = None,
+        bkgresp: bool = True,
+        asolfile: str | Path | None = None,
+        maskfile: str | Path | None = None,
+        badpixfile: str | Path | None = None,
+        dafile: str | None = None,
+        energy: str = "0.3:11.0:0.01",
+        channel: str = "1:1024:1",
+        parallel: bool = True,
+        nproc: int | None = None,
+        tmpdir: str | Path | None = None,
+        verbose: int = 0,
+        clobber: bool = False,
+    ) -> CIAOSpectrum:
+        """Extract a source spectrum with responses using CIAO's ``specextract``.
+
+        The source extraction region comes from this view's lazy filters, so
+        select it first with :meth:`region` (or a raw ``sky=...`` filter).
+        ``bkgfile`` adds a background spectrum: pass a region-file path to
+        extract it from the same event file, a :class:`CIAOEvents` view for
+        full control, or a :class:`CIAOBlankSky` — background responses cannot
+        be built for blank-sky files, so ``bkgresp`` is forced off for them.
+
+        ``weight=True`` builds responses weighted by the count distribution
+        (extended sources); ``weight=False`` builds unweighted point-source
+        responses at ``refcoord`` (or the region center), optionally with the
+        ``correctpsf`` aperture correction. Ancillary files are looked up from
+        the event-file header unless given explicitly; ``asolfile`` accepts
+        CIAO stack syntax for multiple aspect solutions. Scope is ACIS
+        imaging-mode, single observation.
+
+        ``outroot`` is a file prefix, not a directory: ``"spectrum/3843"``
+        writes ``spectrum/3843.pi`` and its siblings, creating missing
+        directories.
+        """
+        from .products.blanksky import CIAOBlankSky
+
+        grouptype = grouptype.upper()
+        if grouptype not in _GROUP_TYPES:
+            raise ValueError(f"grouptype must be one of {sorted(_GROUP_TYPES)}")
+        if grouptype == "NONE":
+            binspec = "NONE"
+
+        bkg_grouptype = bkg_grouptype.upper()
+        if bkg_grouptype not in _GROUP_TYPES:
+            raise ValueError(f"bkg_grouptype must be one of {sorted(_GROUP_TYPES)}")
+        if bkg_grouptype == "NONE":
+            bkg_binspec = "NONE"
+        elif bkg_binspec is None:
+            raise ValueError("bkg_binspec is required when bkg_grouptype groups")
+
+        require_file(self.filename, "event file")
+        if not any(f.startswith("sky=") for f in self.filters):
+            logger.warning(
+                "specextract without a sky region filter extracts a full-chip spectrum"
+            )
+
+        background = None
+        if bkgfile is not None:
+            if isinstance(bkgfile, CIAOBlankSky):
+                require_file(bkgfile.path, "blanksky background file")
+                background = str(bkgfile.path)
+                if bkgresp:
+                    logger.info("blank-sky backgrounds have no responses; bkgresp=no")
+                bkgresp = False
+            elif isinstance(bkgfile, CIAOEvents):
+                require_file(bkgfile.filename, "background event file")
+                background = bkgfile.dm
+            else:
+                region = Path(bkgfile)
+                require_file(region, "background region file")
+                background = f"{self.filename}[sky=region({region})]"
+
+        raw = str(outroot)
+        if raw.endswith("/"):
+            raise ValueError(
+                "outroot is a file prefix, not a directory: "
+                f'use "{raw}name" to write into a directory'
+            )
+        expected = Path(f"{raw}.pi")
+        prepare_output_path(expected, clobber=clobber, create_parents=True)
+
+        options: dict[str, Any] = {}
+        if background is not None:
+            options["bkgfile"] = background
+        if refcoord is not None:
+            if isinstance(refcoord, tuple):
+                refcoord = f"{refcoord[0]} {refcoord[1]}"
+            options["refcoord"] = refcoord
+        if asolfile is not None:
+            options["asp"] = str(asolfile)
+        if maskfile is not None:
+            options["mskfile"] = str(maskfile)
+        if badpixfile is not None:
+            options["badpixfile"] = str(badpixfile)
+        if dafile is not None:
+            options["dafile"] = dafile
+        if nproc is not None:
+            options["nproc"] = nproc
+        if tmpdir is not None:
+            options["tmpdir"] = str(tmpdir)
+
+        runtool = require_ciao_runtool()
+        logger.info("specextract: %s", self.dm)
+        logger.info("outroot: %s", raw)
+        started = time.time()
+        runtool.specextract(
+            infile=self.dm,
+            outroot=raw,
+            weight=weight,
+            weight_rmf=weight_rmf,
+            correctpsf=correctpsf,
+            grouptype=grouptype,
+            binspec=binspec,
+            bkg_grouptype=bkg_grouptype,
+            bkg_binspec=bkg_binspec,
+            bkgresp=bkgresp,
+            energy=energy,
+            channel=channel,
+            parallel=parallel,
+            verbose=verbose,
+            clobber=clobber,
+            **options,
+        )
+
+        return _discover_spectrum(raw, since=started)
 
 
 def merge_events(

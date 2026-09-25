@@ -14,11 +14,13 @@ from xray_tools import (
     CIAOFluxImage,
     CIAOImage,
     CIAOLightCurve,
+    CIAOSpectrum,
     CIAOWorkflowError,
     LightCurveCuts,
 )
 from xray_tools.products.gti import _parse_userlimit_cuts
 from xray_tools.products.image import _discover_flux_images
+from xray_tools.products.spectrum import _discover_spectrum
 
 
 class FakeColumn:
@@ -76,6 +78,10 @@ def test_product_paths_are_normalized() -> None:
     assert CIAOLightCurve("background.lc").path == Path("background.lc")
     assert CIAOGTI("background.gti").path == Path("background.gti")
     assert CIAOImage("broad_flux.img").path == Path("broad_flux.img")
+    spectrum = CIAOSpectrum("spec.pi", grouped_source="spec_grp.pi")
+    assert spectrum.source == Path("spec.pi")
+    assert spectrum.grouped_source == Path("spec_grp.pi")
+    assert spectrum.arf is None
 
 
 def test_lightcurve_to_pandas_handles_optional_columns(
@@ -767,3 +773,122 @@ def test_blanksky_images_refuse_implicit_overwrite(tmp_path: Path) -> None:
         CIAOBlankSky(bkg).images(tmp_path / "obs", reference)
 
     runtool.blanksky_image.assert_not_called()
+
+
+def _touch_spectrum_products(directory: Path, prefix: str, *names: str) -> dict[str, Path]:
+    return {name: _touch(directory / f"{prefix}{name}") for name in names}
+
+
+_SPECTRUM_NAMES = (
+    ".pi",
+    ".arf",
+    ".rmf",
+    "_grp.pi",
+    "_bkg.pi",
+    "_bkg.arf",
+    "_bkg.rmf",
+    "_bkg_grp.pi",
+)
+
+
+def test_discover_spectrum_maps_products_and_skips_stale(tmp_path: Path) -> None:
+    files = _touch_spectrum_products(tmp_path, "spec", *_SPECTRUM_NAMES)
+    _touch(tmp_path / "other.pi", stale=True)
+    _touch(tmp_path / "spec.corr.arf", stale=True)
+
+    spectrum = _discover_spectrum(tmp_path / "spec", since=time.time() - 5)
+
+    assert spectrum == CIAOSpectrum(
+        source=files[".pi"],
+        arf=files[".arf"],
+        rmf=files[".rmf"],
+        background=files["_bkg.pi"],
+        grouped_source=files["_grp.pi"],
+        grouped_background=files["_bkg_grp.pi"],
+        bkg_arf=files["_bkg.arf"],
+        bkg_rmf=files["_bkg.rmf"],
+    )
+
+
+def test_discover_spectrum_prefers_the_corrected_arf(tmp_path: Path) -> None:
+    files = _touch_spectrum_products(tmp_path, "spec", ".pi", ".arf", ".corr.arf")
+
+    spectrum = _discover_spectrum(tmp_path / "spec", since=time.time() - 5)
+
+    assert spectrum.arf == files[".corr.arf"]
+    assert spectrum.background is None
+    assert spectrum.grouped_source is None
+    assert spectrum.bkg_arf is None
+
+
+def test_discover_spectrum_supports_nested_prefixes(tmp_path: Path) -> None:
+    directory = tmp_path / "spectrum"
+    directory.mkdir()
+    files = _touch_spectrum_products(directory, "3843", ".pi", ".rmf")
+
+    spectrum = _discover_spectrum(directory / "3843", since=time.time() - 5)
+
+    assert spectrum.source == files[".pi"]
+    assert spectrum.rmf == files[".rmf"]
+    assert spectrum.arf is None
+
+
+def test_discover_spectrum_requires_a_source_spectrum(tmp_path: Path) -> None:
+    _touch(tmp_path / "spec_bkg.pi")
+
+    with pytest.raises(CIAOWorkflowError, match="no source spectrum"):
+        _discover_spectrum(tmp_path / "spec", since=time.time() - 5)
+
+
+def test_spectrum_exposes_header_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "spec.pi"
+    path.touch()
+    crate = _key_crate({"EXPOSURE": 67045.4, "BACKSCAL": 2.5e-6, "TOTCTS": 1234})
+    spectrum = CIAOSpectrum(path)
+
+    with patch("xray_tools.products.spectrum.require_pycrates", return_value=fake_pycrates(crate)):
+        assert spectrum.exposure == pytest.approx(67045.4)
+        assert spectrum.backscal == pytest.approx(2.5e-6)
+        assert spectrum.counts == 1234
+
+
+def test_spectrum_metadata_defaults_to_none(tmp_path: Path) -> None:
+    path = tmp_path / "spec.pi"
+    path.touch()
+    crate = _key_crate({})
+
+    with patch("xray_tools.products.spectrum.require_pycrates", return_value=fake_pycrates(crate)):
+        spectrum = CIAOSpectrum(path)
+        assert spectrum.exposure is None
+        assert spectrum.backscal is None
+        assert spectrum.counts is None
+
+
+def test_spectrum_to_sherpa_prefers_the_grouped_spectrum(tmp_path: Path) -> None:
+    source = tmp_path / "spec.pi"
+    source.touch()
+    grouped = tmp_path / "spec_grp.pi"
+    grouped.touch()
+    sherpa_io = Mock()
+
+    with patch("xray_tools.products.spectrum.require_sherpa", return_value=sherpa_io):
+        result = CIAOSpectrum(source, grouped_source=grouped).to_sherpa(use_errors=True)
+
+    sherpa_io.read_pha.assert_called_once_with(str(grouped), use_errors=True)
+    assert result is sherpa_io.read_pha.return_value
+
+
+def test_spectrum_to_sherpa_falls_back_to_the_ungrouped_spectrum(tmp_path: Path) -> None:
+    source = tmp_path / "spec.pi"
+    source.touch()
+    grouped = tmp_path / "spec_grp.pi"
+    grouped.touch()
+    sherpa_io = Mock()
+
+    with patch("xray_tools.products.spectrum.require_sherpa", return_value=sherpa_io):
+        CIAOSpectrum(source, grouped_source=grouped).to_sherpa(prefer_grouped=False)
+        CIAOSpectrum(source).to_sherpa()
+
+    first, second = sherpa_io.read_pha.call_args_list
+    assert first.args == (str(source),)
+    assert second.args == (str(source),)
