@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from pathlib import Path
@@ -15,6 +16,7 @@ from xray_tools import (
     CIAOImage,
     CIAOLightCurve,
     CIAOSpectrum,
+    CIAOWavDetect,
     CIAOWorkflowError,
     LightCurveCuts,
 )
@@ -892,3 +894,301 @@ def test_spectrum_to_sherpa_falls_back_to_the_ungrouped_spectrum(tmp_path: Path)
     first, second = sherpa_io.read_pha.call_args_list
     assert first.args == (str(source),)
     assert second.args == (str(source),)
+
+
+def _shape_crate(shape: tuple[int, int] = (128, 128)) -> Mock:
+    crate = Mock()
+    crate.is_image.return_value = True
+    crate.get_shape.return_value = shape
+    return crate
+
+
+def _wavdetect_runtool() -> Mock:
+    """A runtool mock whose wavdetect creates the five expected outputs."""
+    runtool = Mock()
+
+    def fake_run(**kwargs):
+        for key in ("outfile", "scellfile", "imagefile", "defnbkgfile", "regfile"):
+            Path(kwargs[key]).touch()
+
+    runtool.wavdetect.side_effect = fake_run
+    return runtool
+
+
+def _wavdetect_product(tmp_path: Path, **overrides) -> CIAOFluxImage:
+    components = {"counts": None, "flux": None, "exposure": None, "fov": None, "psf": None}
+    components.update(overrides)
+    return CIAOFluxImage(band="broad", **components)
+
+
+def test_wavdetect_product_paths_are_normalized() -> None:
+    product = CIAOWavDetect(
+        sources="det_src.fits",
+        cell="det_scell.fits",
+        image="det_image.fits",
+        background="det_nbkg.fits",
+        regions="det_src.reg",
+    )
+
+    assert product.sources == Path("det_src.fits")
+    assert product.regions == Path("det_src.reg")
+    assert product.cell == CIAOImage("det_scell.fits")
+    assert product.image == CIAOImage("det_image.fits")
+    assert product.background == CIAOImage("det_nbkg.fits")
+    assert product.band is None
+
+
+def test_wavdetect_wires_flux_image_components(tmp_path: Path) -> None:
+    counts = _touch(tmp_path / "band_thresh.img")
+    exposure = _touch(tmp_path / "band_thresh.expmap")
+    psf = _touch(tmp_path / "band_thresh.psfmap")
+    product = _wavdetect_product(tmp_path, counts=counts, exposure=exposure, psf=psf)
+    runtool = _wavdetect_runtool()
+
+    with (
+        patch("xray_tools.products.wavdetect.require_ciao_runtool", return_value=runtool),
+        patch(
+            "xray_tools.products.image.require_pycrates",
+            return_value=fake_pycrates(_shape_crate()),
+        ),
+    ):
+        result = product.wavdetect(tmp_path / "det")
+
+    runtool.wavdetect.assert_called_once_with(
+        infile=str(counts),
+        outfile=str(tmp_path / "det_src.fits"),
+        scellfile=str(tmp_path / "det_scell.fits"),
+        imagefile=str(tmp_path / "det_image.fits"),
+        defnbkgfile=str(tmp_path / "det_nbkg.fits"),
+        regfile=str(tmp_path / "det_src.reg"),
+        scales="1 2 4 8 16",
+        expfile=str(exposure),
+        psffile=str(psf),
+        ellsigma=3.0,
+        expthresh=0.1,
+        verbose=0,
+        clobber=False,
+    )
+    assert result == CIAOWavDetect(
+        sources=tmp_path / "det_src.fits",
+        cell=tmp_path / "det_scell.fits",
+        image=tmp_path / "det_image.fits",
+        background=tmp_path / "det_nbkg.fits",
+        regions=tmp_path / "det_src.reg",
+        band="broad",
+    )
+
+
+def test_wavdetect_forwards_detection_options(tmp_path: Path) -> None:
+    counts = _touch(tmp_path / "band_thresh.img")
+    background = _touch(tmp_path / "bgnd.img")
+    product = _wavdetect_product(tmp_path, counts=counts)
+    runtool = _wavdetect_runtool()
+
+    with (
+        patch("xray_tools.products.wavdetect.require_ciao_runtool", return_value=runtool),
+        patch(
+            "xray_tools.products.image.require_pycrates",
+            return_value=fake_pycrates(_shape_crate()),
+        ),
+    ):
+        product.wavdetect(
+            tmp_path / "det",
+            scales=(0.5, 1.4, 2),
+            sigthresh=1e-5,
+            falsesrc=0.5,
+            ellsigma=4.0,
+            expthresh=0.2,
+            background=background,
+            verbose=2,
+            clobber=True,
+        )
+
+    kwargs = runtool.wavdetect.call_args.kwargs
+    assert kwargs["scales"] == "0.5 1.4 2"
+    assert kwargs["sigthresh"] == 1e-5
+    assert kwargs["falsesrc"] == 0.5
+    assert kwargs["ellsigma"] == 4.0
+    assert kwargs["expthresh"] == 0.2
+    assert kwargs["bkginput"] == str(background)
+    assert kwargs["verbose"] == 2
+    assert kwargs["clobber"] is True
+
+
+def test_wavdetect_accepts_a_ciao_image_background(tmp_path: Path) -> None:
+    counts = _touch(tmp_path / "band_thresh.img")
+    background = _touch(tmp_path / "bgnd.img")
+    product = _wavdetect_product(tmp_path, counts=counts)
+    runtool = _wavdetect_runtool()
+
+    with (
+        patch("xray_tools.products.wavdetect.require_ciao_runtool", return_value=runtool),
+        patch(
+            "xray_tools.products.image.require_pycrates",
+            return_value=fake_pycrates(_shape_crate()),
+        ),
+    ):
+        product.wavdetect(tmp_path / "det", background=CIAOImage(background))
+
+    assert runtool.wavdetect.call_args.kwargs["bkginput"] == str(background)
+
+
+def test_wavdetect_requires_a_counts_image(tmp_path: Path) -> None:
+    flux = _touch(tmp_path / "band_flux.img")
+    product = _wavdetect_product(tmp_path, flux=flux)
+
+    with pytest.raises(CIAOWorkflowError, match="counts image"):
+        product.wavdetect(tmp_path / "det")
+
+
+def test_wavdetect_validates_parameters(tmp_path: Path) -> None:
+    counts = _touch(tmp_path / "band_thresh.img")
+    product = _wavdetect_product(tmp_path, counts=counts)
+
+    with pytest.raises(ValueError, match="scales"):
+        product.wavdetect(tmp_path / "det", scales=(2, 0))
+    with pytest.raises(ValueError, match="scales"):
+        product.wavdetect(tmp_path / "det", scales=())
+    with pytest.raises(ValueError, match="sigthresh"):
+        product.wavdetect(tmp_path / "det", sigthresh=0)
+    with pytest.raises(ValueError, match="falsesrc"):
+        product.wavdetect(tmp_path / "det", falsesrc=0)
+    with pytest.raises(ValueError, match="ellsigma"):
+        product.wavdetect(tmp_path / "det", ellsigma=0)
+    with pytest.raises(ValueError, match="expthresh"):
+        product.wavdetect(tmp_path / "det", expthresh=1.5)
+    with pytest.raises(ValueError, match="file prefix, not a directory"):
+        product.wavdetect(f"{tmp_path}/")
+
+
+def test_wavdetect_requires_a_real_background(tmp_path: Path) -> None:
+    counts = _touch(tmp_path / "band_thresh.img")
+    product = _wavdetect_product(tmp_path, counts=counts)
+
+    with pytest.raises(FileNotFoundError, match="background image"):
+        product.wavdetect(tmp_path / "det", background=tmp_path / "missing.img")
+
+
+def test_wavdetect_without_psf_map_warns_and_omits_psffile(
+    tmp_path: Path, caplog
+) -> None:
+    counts = _touch(tmp_path / "band_thresh.img")
+    product = _wavdetect_product(tmp_path, counts=counts)
+    runtool = _wavdetect_runtool()
+
+    with (
+        patch("xray_tools.products.wavdetect.require_ciao_runtool", return_value=runtool),
+        patch(
+            "xray_tools.products.image.require_pycrates",
+            return_value=fake_pycrates(_shape_crate()),
+        ),
+        caplog.at_level(logging.WARNING, logger="xray_tools"),
+    ):
+        product.wavdetect(tmp_path / "det")
+
+    kwargs = runtool.wavdetect.call_args.kwargs
+    assert "psffile" not in kwargs
+    assert "expfile" not in kwargs
+    assert "no PSF map" in caplog.text
+
+
+def test_wavdetect_warns_about_large_images(tmp_path: Path, caplog) -> None:
+    counts = _touch(tmp_path / "band_thresh.img")
+    product = _wavdetect_product(tmp_path, counts=counts)
+    runtool = _wavdetect_runtool()
+
+    with (
+        patch("xray_tools.products.wavdetect.require_ciao_runtool", return_value=runtool),
+        patch(
+            "xray_tools.products.image.require_pycrates",
+            return_value=fake_pycrates(_shape_crate((3000, 3000))),
+        ),
+        caplog.at_level(logging.WARNING, logger="xray_tools"),
+    ):
+        product.wavdetect(tmp_path / "det")
+
+    assert "1-2 GB" in caplog.text
+
+
+def test_wavdetect_refuses_implicit_overwrite(tmp_path: Path) -> None:
+    counts = _touch(tmp_path / "band_thresh.img")
+    _touch(tmp_path / "det_nbkg.fits")
+    product = _wavdetect_product(tmp_path, counts=counts)
+    runtool = Mock()
+
+    with (
+        patch(
+            "xray_tools.products.wavdetect.require_ciao_runtool", return_value=runtool
+        ),
+        patch(
+            "xray_tools.products.image.require_pycrates",
+            return_value=fake_pycrates(_shape_crate()),
+        ),
+        pytest.raises(FileExistsError, match="already exists"),
+    ):
+        product.wavdetect(tmp_path / "det")
+
+    runtool.wavdetect.assert_not_called()
+
+
+def test_wavdetect_raises_when_outputs_are_missing(tmp_path: Path) -> None:
+    counts = _touch(tmp_path / "band_thresh.img")
+    product = _wavdetect_product(tmp_path, counts=counts)
+    runtool = Mock()
+
+    with (
+        patch(
+            "xray_tools.products.wavdetect.require_ciao_runtool", return_value=runtool
+        ),
+        patch(
+            "xray_tools.products.image.require_pycrates",
+            return_value=fake_pycrates(_shape_crate()),
+        ),
+        pytest.raises(CIAOWorkflowError, match="did not create"),
+    ):
+        product.wavdetect(tmp_path / "det")
+
+
+def test_wavdetect_to_pandas_reads_the_srclist_block(tmp_path: Path) -> None:
+    sources = _touch(tmp_path / "det_src.fits")
+    crate = FakeCrate(
+        {
+            "RA": np.array([212.75, 212.99]),
+            "DEC": np.array([52.06, 52.10]),
+            "NET_COUNTS": np.array([100.0, 25.0]),
+            "R": np.array([[1.0, 0.8], [2.0, 1.5]]),
+        }
+    )
+    pycrates = Mock()
+    pycrates.read_file.return_value = crate
+
+    with patch("xray_tools.products.wavdetect.require_pycrates", return_value=pycrates):
+        frame = CIAOWavDetect(sources).to_pandas()
+
+    pycrates.read_file.assert_called_once_with(f"{sources}[SRCLIST]")
+    assert list(frame.columns) == ["ra", "dec", "net_counts", "r"]
+    assert frame["net_counts"].tolist() == [100.0, 25.0]
+    assert list(frame["r"].iloc[0]) == [1.0, 0.8]
+
+
+def test_wavdetect_to_pandas_expands_virtual_vector_columns(tmp_path: Path) -> None:
+    class VectorCrate(FakeCrate):
+        def get_colnames(self):
+            return ["RA", "POS(X, Y)"]
+
+    sources = _touch(tmp_path / "det_src.fits")
+    crate = VectorCrate(
+        {
+            "RA": np.array([212.75]),
+            "X": np.array([4123.0]),
+            "Y": np.array([3987.0]),
+        }
+    )
+    pycrates = Mock()
+    pycrates.read_file.return_value = crate
+
+    with patch("xray_tools.products.wavdetect.require_pycrates", return_value=pycrates):
+        frame = CIAOWavDetect(sources).to_pandas()
+
+    assert list(frame.columns) == ["ra", "x", "y"]
+    assert frame["x"].tolist() == [4123.0]

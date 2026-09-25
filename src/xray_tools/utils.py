@@ -67,6 +67,15 @@ def require_file(path: Path, description: str) -> None:
         raise FileNotFoundError(f"{description} does not exist: {path}")
 
 
+def _column_components(name: str) -> tuple[str, ...]:
+    """Expand a pycrates vector label such as ``sky(x, y)``."""
+    start = name.find("(")
+    if start == -1 or not name.endswith(")"):
+        return (name,)
+
+    return tuple(component.strip() for component in name[start + 1 : -1].split(","))
+
+
 def prepare_output_path(
     outfile: str | Path,
     *,

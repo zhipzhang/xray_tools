@@ -5,6 +5,7 @@ from .gti import CIAOGTI, LightCurveCuts
 from .image import CIAOFluxImage, CIAOImage
 from .lightcurve import CIAOLightCurve
 from .spectrum import CIAOSpectrum
+from .wavdetect import CIAOWavDetect
 
 __all__ = [
     "CIAOGTI",
@@ -14,5 +15,6 @@ __all__ = [
     "CIAOImage",
     "CIAOLightCurve",
     "CIAOSpectrum",
+    "CIAOWavDetect",
     "LightCurveCuts",
 ]

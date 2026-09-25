@@ -38,11 +38,20 @@ images = events.fluximage(
     "products/ss433",      # trailing "/" would write into a directory instead
     energy=(0.5, 7.0),     # custom band; effective energy = sqrt(lo * hi)
     binsize=4,
+    psfecf=0.393,          # also write the PSF map wavdetect uses
     clobber=True,
 )
 images["0.5-7"].flux.plot()                    # log stretch, WCS axes, BUNIT colorbar
 images["0.5-7"].counts.to_numpy(masked=True)   # MaskedArray; NaN pixels carry no data
 images["0.5-7"].flux.path                      # products/ss433_0.5-7_flux.img
+
+det = images["0.5-7"].wavdetect(   # counts + expmap + psfmap wire up automatically
+    "products/ss433_0.5-7",        # writes _src.fits, _scell.fits, _image.fits, _nbkg.fits, _src.reg
+    sigthresh=1e-6,                # scales default to (1, 2, 4, 8, 16)
+    clobber=True,
+)
+det.to_pandas()[["ra", "dec", "net_counts", "psf_size"]]   # the SRCLIST table
+det.image.plot()                     # reconstructed, de-noised source image
 
 blank = events.blanksky("products/3843_blank_evt.fits", clobber=True)
 blank.method, blank.scales          # "particle", {0: 0.039, 1: 0.041, ...} per chip

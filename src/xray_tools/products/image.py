@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -13,6 +15,11 @@ from ..utils import require_file, require_pycrates
 if TYPE_CHECKING:
     import numpy as np
     from matplotlib.axes import Axes
+
+    from .wavdetect import CIAOWavDetect
+
+
+logger = logging.getLogger("xray_tools")
 
 
 @dataclass(frozen=True)
@@ -218,6 +225,111 @@ class CIAOFluxImage:
         if image is None:
             raise ValueError(f"the {component} image is not available for this band")
         return image.plot(ax=ax, **kwargs)
+
+    def wavdetect(
+        self,
+        outroot: str | Path,
+        *,
+        scales: Sequence[float] = (1, 2, 4, 8, 16),
+        sigthresh: float | None = None,
+        falsesrc: float | None = None,
+        ellsigma: float = 3.0,
+        expthresh: float = 0.1,
+        background: CIAOImage | str | Path | None = None,
+        verbose: int = 0,
+        clobber: bool = False,
+    ) -> CIAOWavDetect:
+        """Detect sources in this band's counts image with CIAO's ``wavdetect``.
+
+        The exposure map and PSF map components are wired up automatically,
+        so the three inputs always share the grid of the fluximage run that
+        produced them. wavdetect assumes Poisson statistics, so the detection
+        always runs on the ``counts`` component, never on the fluxed image.
+
+        ``scales`` lists the Mexican-Hat wavelet radii in image pixels; the
+        default ``(1, 2, 4, 8, 16)`` follows the wavdetect thread's
+        recommendation for Chandra data and deliberately diverges from CIAO's
+        minimal ``"2.0 4.0"`` default. ``sigthresh`` is the per-pixel
+        detection significance (CIAO default 1e-6, ~1 false source per
+        1000x1000 pixels); ``falsesrc`` instead sets a per-scale false-source
+        budget and, when given, makes CIAO ignore ``sigthresh``. ``ellsigma``
+        scales the source ellipses written to the region file; ``expthresh``
+        drops pixels whose relative exposure falls below the given fraction.
+        ``background`` supplies a predetermined normalized background image
+        (wavdetect's ``bkginput``) instead of estimating one from the data.
+
+        ``outroot`` is a file prefix: ``"detect/3843_2-7"`` writes
+        ``detect/3843_2-7_src.fits`` and its ``_scell.fits`` / ``_image.fits``
+        / ``_nbkg.fits`` / ``_src.reg`` siblings, creating missing
+        directories. The ``regions`` product feeds straight back into
+        :meth:`CIAOEvents.region` / :meth:`CIAOEvents.exclude_region`.
+        """
+        from .wavdetect import _wavdetect
+
+        if self.counts is None:
+            raise CIAOWorkflowError(
+                f"wavdetect needs the counts image of the band; "
+                f"the {self.band!r} band has none"
+            )
+        if not scales or any(scale <= 0 for scale in scales):
+            raise ValueError("scales must contain positive wavelet radii in pixels")
+        if sigthresh is not None and sigthresh <= 0:
+            raise ValueError("sigthresh must be positive")
+        if falsesrc is not None and falsesrc <= 0:
+            raise ValueError("falsesrc must be positive")
+        if ellsigma <= 0:
+            raise ValueError("ellsigma must be positive")
+        if not 0 < expthresh <= 1:
+            raise ValueError("expthresh must be within (0, 1]")
+
+        raw = str(outroot)
+        if raw.endswith("/"):
+            raise ValueError(
+                "outroot is a file prefix, not a directory: "
+                f'use "{raw}name" to write into a directory'
+            )
+
+        background_path = None
+        if background is not None:
+            background_path = (
+                background.path if isinstance(background, CIAOImage) else Path(background)
+            )
+            require_file(background_path, "background image")
+
+        if self.psf is None:
+            logger.warning(
+                "no PSF map for the %r band: detection is unaffected, but source "
+                "characteristics are unreliable; run fluximage(psfecf=...)",
+                self.band,
+            )
+        if falsesrc is not None and sigthresh is not None:
+            logger.info("falsesrc is set; wavdetect ignores sigthresh")
+
+        npix = 1
+        for axis in self.counts.shape:
+            npix *= axis
+        if npix > 2048 * 2048:
+            logger.warning(
+                "image has %d pixels; wavdetect needs at least 1-2 GB of memory "
+                "beyond 2048x2048",
+                npix,
+            )
+
+        return _wavdetect(
+            self.counts.path,
+            raw,
+            expfile=self.exposure.path if self.exposure is not None else None,
+            psffile=self.psf.path if self.psf is not None else None,
+            scales=" ".join(f"{scale:g}" for scale in scales),
+            sigthresh=sigthresh,
+            falsesrc=falsesrc,
+            ellsigma=ellsigma,
+            expthresh=expthresh,
+            bkginput=background_path,
+            band=self.band,
+            verbose=verbose,
+            clobber=clobber,
+        )
 
 
 def _discover_flux_images(

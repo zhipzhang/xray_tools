@@ -12,6 +12,7 @@ from .products import (
     CIAOImage,
     CIAOLightCurve,
     CIAOSpectrum,
+    CIAOWavDetect,
     LightCurveCuts,
 )
 from .units import energy_to_wavelength, wavelength_to_energy
@@ -25,6 +26,7 @@ __all__ = [
     "CIAOImage",
     "CIAOLightCurve",
     "CIAOSpectrum",
+    "CIAOWavDetect",
     "CIAOWorkflowError",
     "ChandraACIS",
     "LightCurveCuts",

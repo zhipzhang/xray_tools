@@ -14,6 +14,7 @@ from .exceptions import CIAOWorkflowError
 from .products.image import _discover_flux_images
 from .products.spectrum import _discover_spectrum
 from .utils import (
+    _column_components,
     prepare_output_path,
     require_ciao_runtool,
     require_file,
@@ -553,15 +554,6 @@ def _serialize_energy_bands(
         eff = (lo * hi) ** 0.5
         parts.append(f"{lo:g}:{hi:g}:{eff:.6g}")
     return ",".join(parts)
-
-
-def _column_components(name: str) -> tuple[str, ...]:
-    """Expand a pycrates vector label such as ``sky(x, y)``."""
-    start = name.find("(")
-    if start == -1 or not name.endswith(")"):
-        return (name,)
-
-    return tuple(component.strip() for component in name[start + 1 : -1].split(","))
 
 
 def _invert_filter(expression: str) -> str:
