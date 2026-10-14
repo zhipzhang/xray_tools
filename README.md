@@ -58,6 +58,9 @@ blank.method, blank.scales          # "particle", {0: 0.039, 1: 0.041, ...} per 
 bgs = blank.images("products/ss433_bkg", images["0.5-7"].counts)
 bgs.subtracted.plot()               # background-subtracted counts image
 
+net = images["0.5-7"].counts - bgs.background   # dmimgcalc into a temp file (+ - * / work)
+net = net.save("products/ss433_0.5-7_net.img", clobber=True)  # moved into place
+
 spec = events.region("src.reg").specextract(
     "products/3c273",               # writes products/3c273.{pi,arf,rmf}, 3c273_bkg.pi, ...
     bkgfile="bkg.reg",              # or a CIAOEvents / CIAOBlankSky background

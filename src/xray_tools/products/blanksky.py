@@ -86,7 +86,10 @@ class CIAOBlankSky:
         ``{outroot}_{method}_bgnd.img`` and ``{outroot}_{method}_bkgsub.img``.
         """
         require_file(self.path, "blanksky background file")
-        reference_path = Path(getattr(reference, "path", reference))
+        if isinstance(reference, CIAOImage):
+            reference_path = Path(reference.path)
+        else:
+            reference_path = Path(reference)
         require_file(reference_path, "reference image")
         prepare_output_path(
             f"{outroot}_{self.method}_bgnd.img",

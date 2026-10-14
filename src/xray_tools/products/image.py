@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
+import os
+import shutil
+import tempfile
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cached_property
+from numbers import Number
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..exceptions import CIAOWorkflowError
-from ..utils import require_file, require_pycrates
+from ..utils import (
+    prepare_output_path,
+    require_ciao_runtool,
+    require_file,
+    require_pycrates,
+)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -20,6 +31,54 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger("xray_tools")
+
+_OPERATION_SYMBOLS = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
+
+_TEMP_IMAGES: dict[Path, weakref.finalize] = {}
+
+
+def _unlink_temp(path: Path) -> None:
+    _TEMP_IMAGES.pop(path, None)
+    path.unlink(missing_ok=True)
+
+
+def _cleanup_temp_images() -> None:
+    for path in list(_TEMP_IMAGES):
+        _unlink_temp(path)
+
+
+atexit.register(_cleanup_temp_images)
+
+
+def _dmimgcalc(
+    infile1: str | Path,
+    infile2: str | Path | None,
+    outfile: str | Path,
+    operation: str,
+    *,
+    clobber: bool = False,
+    verbose: int = 0,
+) -> Path:
+    """Run CIAO dmimgcalc and return the output path."""
+    infile1 = Path(infile1)
+    require_file(infile1, "image")
+    if infile2 is not None:
+        infile2 = Path(infile2)
+        require_file(infile2, "image")
+    output = prepare_output_path(outfile, clobber=clobber)
+
+    runtool = require_ciao_runtool()
+    logger.info("dmimgcalc: %s %s %s", infile1, operation, infile2 or "")
+    logger.info("output: %s", output)
+    runtool.dmimgcalc(
+        infile=str(infile1),
+        infile2="none" if infile2 is None else str(infile2),
+        outfile=str(output),
+        operation=operation,
+        clobber=clobber,
+        verbose=verbose,
+    )
+    return output
 
 
 @dataclass(frozen=True)
@@ -179,6 +238,91 @@ class CIAOImage:
         if title is not None:
             ax.set_title(title)
         return ax
+
+    def _combine(
+        self,
+        other: CIAOImage | str | Path | float,
+        operation: str,
+        *,
+        reflected: bool = False,
+    ) -> CIAOImage:
+        """Run dmimgcalc for one arithmetic operator into a temp image.
+
+        Numbers take dmimgcalc's expression mode (``imgout=img1*2``);
+        image-like operands take the matching simple operation and are
+        shape-checked against this image first.
+        """
+        if isinstance(other, Number):
+            symbol = _OPERATION_SYMBOLS[operation]
+            value = f"{other:g}"
+            left, right = (value, "img1") if reflected else ("img1", value)
+            infile2 = None
+            dm_operation = f"imgout={left}{symbol}{right}"
+        elif isinstance(other, (CIAOImage, str, Path)):
+            if reflected:
+                return NotImplemented
+            other_image = other if isinstance(other, CIAOImage) else CIAOImage(other)
+            if self.shape != other_image.shape:
+                raise ValueError(
+                    f"image shapes differ: {self.shape} vs {other_image.shape}"
+                )
+            infile2 = other_image.path
+            dm_operation = operation
+        else:
+            return NotImplemented
+
+        fd, name = tempfile.mkstemp(prefix="xray_tools_", suffix=".img")
+        os.close(fd)
+        output = Path(name)
+        _dmimgcalc(self.path, infile2, output, dm_operation, clobber=True)
+        image = CIAOImage(output)
+        _TEMP_IMAGES[output] = weakref.finalize(image, _unlink_temp, output)
+        return image
+
+    def __add__(self, other: CIAOImage | str | Path | float) -> CIAOImage:
+        """``self + other`` — dmimgcalc into a temp image; persist with ``save()``."""
+        return self._combine(other, "add")
+
+    def __radd__(self, other: CIAOImage | str | Path | float) -> CIAOImage:
+        return self._combine(other, "add", reflected=True)
+
+    def __sub__(self, other: CIAOImage | str | Path | float) -> CIAOImage:
+        """``self - other`` — dmimgcalc into a temp image; persist with ``save()``."""
+        return self._combine(other, "sub")
+
+    def __rsub__(self, other: CIAOImage | str | Path | float) -> CIAOImage:
+        return self._combine(other, "sub", reflected=True)
+
+    def __mul__(self, other: CIAOImage | str | Path | float) -> CIAOImage:
+        """``self * other`` — dmimgcalc into a temp image; persist with ``save()``."""
+        return self._combine(other, "mul")
+
+    def __rmul__(self, other: CIAOImage | str | Path | float) -> CIAOImage:
+        return self._combine(other, "mul", reflected=True)
+
+    def __truediv__(self, other: CIAOImage | str | Path | float) -> CIAOImage:
+        """``self / other`` — dmimgcalc into a temp image; persist with ``save()``."""
+        return self._combine(other, "div")
+
+    def __rtruediv__(self, other: CIAOImage | str | Path | float) -> CIAOImage:
+        return self._combine(other, "div", reflected=True)
+
+    def save(self, outfile: str | Path, *, clobber: bool = False) -> CIAOImage:
+        """Persist the image to ``outfile`` and return the saved reference.
+
+        A temporary image produced by the arithmetic operators is moved
+        (freeing its temp path); any other image is copied, leaving the
+        original in place.
+        """
+        require_file(self.path, "image")
+        output = prepare_output_path(outfile, clobber=clobber, create_parents=True)
+        finalizer = _TEMP_IMAGES.pop(self.path, None)
+        if finalizer is not None:
+            finalizer.detach()
+            shutil.move(self.path, output)
+        else:
+            shutil.copy(self.path, output)
+        return CIAOImage(output)
 
 
 @dataclass(frozen=True)

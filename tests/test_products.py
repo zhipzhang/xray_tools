@@ -21,7 +21,7 @@ from xray_tools import (
     LightCurveCuts,
 )
 from xray_tools.products.gti import _parse_userlimit_cuts
-from xray_tools.products.image import _discover_flux_images
+from xray_tools.products.image import _cleanup_temp_images, _discover_flux_images, _TEMP_IMAGES
 from xray_tools.products.spectrum import _discover_spectrum
 
 
@@ -1192,3 +1192,177 @@ def test_wavdetect_to_pandas_expands_virtual_vector_columns(tmp_path: Path) -> N
 
     assert list(frame.columns) == ["ra", "x", "y"]
     assert frame["x"].tolist() == [4123.0]
+
+
+def _image_pair(tmp_path: Path) -> tuple[CIAOImage, CIAOImage]:
+    return CIAOImage(_touch(tmp_path / "a.img")), CIAOImage(_touch(tmp_path / "b.img"))
+
+
+def _patch_image_io(runtool: Mock, shape: tuple[int, int] = (128, 128)):
+    return (
+        patch("xray_tools.products.image.require_ciao_runtool", return_value=runtool),
+        patch(
+            "xray_tools.products.image.require_pycrates",
+            return_value=fake_pycrates(_shape_crate(shape)),
+        ),
+    )
+
+
+def test_image_operators_run_dmimgcalc_into_temp_files(tmp_path: Path) -> None:
+    a, b = _image_pair(tmp_path)
+    runtool = Mock()
+    patches = _patch_image_io(runtool)
+
+    with patches[0], patches[1]:
+        result = a + b
+
+    kwargs = runtool.dmimgcalc.call_args.kwargs
+    assert kwargs["infile"] == str(a.path)
+    assert kwargs["infile2"] == str(b.path)
+    assert kwargs["operation"] == "add"
+    assert kwargs["clobber"] is True
+    assert kwargs["verbose"] == 0
+    assert isinstance(result, CIAOImage)
+    assert result.path.name.startswith("xray_tools_")
+    assert result.path.suffix == ".img"
+    assert result.path in _TEMP_IMAGES
+
+
+def test_image_operators_map_to_dmimgcalc_operations(tmp_path: Path) -> None:
+    a, b = _image_pair(tmp_path)
+    runtool = Mock()
+    patches = _patch_image_io(runtool)
+
+    with patches[0], patches[1]:
+        a - b
+        a * b
+        a / b
+
+    operations = [call.kwargs["operation"] for call in runtool.dmimgcalc.call_args_list]
+    assert operations == ["sub", "mul", "div"]
+
+
+def test_image_scalar_operators_use_expression_mode(tmp_path: Path) -> None:
+    a = CIAOImage(_touch(tmp_path / "a.img"))
+    runtool = Mock()
+
+    with patch("xray_tools.products.image.require_ciao_runtool", return_value=runtool):
+        a * 2
+        10 - a
+        a / 4.0
+        3 + a
+
+    calls = [call.kwargs for call in runtool.dmimgcalc.call_args_list]
+    assert [(call["infile2"], call["operation"]) for call in calls] == [
+        ("none", "imgout=img1*2"),
+        ("none", "imgout=10-img1"),
+        ("none", "imgout=img1/4"),
+        ("none", "imgout=3+img1"),
+    ]
+
+
+def test_image_operators_reject_mismatched_shapes(tmp_path: Path) -> None:
+    a, b = _image_pair(tmp_path)
+    crates = {str(a.path): _shape_crate((4, 4)), str(b.path): _shape_crate((8, 8))}
+    pycrates = Mock()
+    pycrates.read_file.side_effect = lambda path: crates[path]
+    runtool = Mock()
+
+    with (
+        patch("xray_tools.products.image.require_ciao_runtool", return_value=runtool),
+        patch("xray_tools.products.image.require_pycrates", return_value=pycrates),
+        pytest.raises(ValueError, match="shapes differ"),
+    ):
+        a + b
+
+    runtool.dmimgcalc.assert_not_called()
+
+
+def test_image_operators_reject_unsupported_operands(tmp_path: Path) -> None:
+    a = CIAOImage(_touch(tmp_path / "a.img"))
+
+    with pytest.raises(TypeError):
+        a + object()
+    with pytest.raises(TypeError):
+        "b.img" - a
+
+
+def test_temp_images_are_unlinked_when_the_result_is_dropped(tmp_path: Path) -> None:
+    a, b = _image_pair(tmp_path)
+    runtool = Mock()
+    patches = _patch_image_io(runtool)
+
+    with patches[0], patches[1]:
+        result = a + b
+
+    temp = result.path
+    del result
+    assert not temp.exists()
+    assert temp not in _TEMP_IMAGES
+
+
+def test_cleanup_temp_images_removes_leftovers(tmp_path: Path) -> None:
+    a, b = _image_pair(tmp_path)
+    runtool = Mock()
+    patches = _patch_image_io(runtool)
+
+    with patches[0], patches[1]:
+        one = a + b
+        two = a - b
+
+    _cleanup_temp_images()
+
+    assert not one.path.exists()
+    assert not two.path.exists()
+    assert one.path not in _TEMP_IMAGES
+    assert two.path not in _TEMP_IMAGES
+
+
+def test_save_moves_a_temp_image(tmp_path: Path) -> None:
+    a, b = _image_pair(tmp_path)
+    runtool = Mock()
+    runtool.dmimgcalc.side_effect = lambda **kwargs: Path(kwargs["outfile"]).write_text("counts")
+    patches = _patch_image_io(runtool)
+
+    with patches[0], patches[1]:
+        result = a + b
+
+    temp = result.path
+    saved = result.save(tmp_path / "out" / "sum.img")
+
+    assert saved == CIAOImage(tmp_path / "out" / "sum.img")
+    assert saved.path.read_text() == "counts"
+    assert not temp.exists()
+    assert temp not in _TEMP_IMAGES
+
+
+def test_save_copies_a_regular_image(tmp_path: Path) -> None:
+    source = _touch(tmp_path / "a.img")
+
+    saved = CIAOImage(source).save(tmp_path / "copy.img")
+
+    assert saved == CIAOImage(tmp_path / "copy.img")
+    assert source.exists()
+    assert saved.path.exists()
+
+
+def test_save_refuses_implicit_overwrite_and_keeps_the_temp(tmp_path: Path) -> None:
+    a, b = _image_pair(tmp_path)
+    runtool = Mock()
+    patches = _patch_image_io(runtool)
+
+    with patches[0], patches[1]:
+        result = a + b
+
+    temp = result.path
+    existing = _touch(tmp_path / "sum.img")
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        result.save(existing)
+
+    assert temp.exists()
+    assert temp in _TEMP_IMAGES
+
+    result.save(existing, clobber=True)
+    assert not temp.exists()
+    assert temp not in _TEMP_IMAGES

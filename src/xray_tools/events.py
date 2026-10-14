@@ -373,6 +373,7 @@ class CIAOEvents:
         dafile: str | None = None,
         energy: str = "0.3:11.0:0.01",
         channel: str = "1:1024:1",
+        binarfwmap: int = 1,
         parallel: bool = True,
         nproc: int | None = None,
         tmpdir: str | Path | None = None,
@@ -421,6 +422,7 @@ class CIAOEvents:
             logger.warning(
                 "specextract without a sky region filter extracts a full-chip spectrum"
             )
+            self.filter("sky=field()")
 
         background = None
         if bkgfile is not None:
@@ -482,6 +484,7 @@ class CIAOEvents:
             bkg_grouptype=bkg_grouptype,
             bkg_binspec=bkg_binspec,
             bkgresp=bkgresp,
+            binarfwmap=binarfwmap,
             energy=energy,
             channel=channel,
             parallel=parallel,
